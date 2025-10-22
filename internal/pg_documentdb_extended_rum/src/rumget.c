@@ -34,6 +34,13 @@ typedef enum RumIndexTransformOperation
 } RumIndexTransformOperation;
 
 
+/* Scan bounds used in comparePartial initialization */
+typedef struct RumItemScanEntryBounds
+{
+	RumItem minItem;
+	RumItem maxItem;
+} RumItemScanEntryBounds;
+
 /* GUC parameter */
 int RumFuzzySearchLimit = 0;
 bool RumAllowOrderByRawKeys = RUM_DEFAULT_ALLOW_ORDER_BY_RAW_KEYS;
@@ -274,6 +281,34 @@ compareCurRumItemScanDirection(RumState *rumstate, RumScanEntry entry,
 									   entry->scanDirection,
 									   &entry->curItem, minItem);
 }
+
+
+#if 0
+inline static bool
+IsEntryInBounds(RumState *rumstate, RumScanEntry scanEntry,
+				RumItem *item, RumItemScanEntryBounds *scanEntryBounds,
+				bool checkMaximum)
+{
+	Assert(ItemPointerIsValid(&scanEntryBounds->minItem.iptr));
+	if (compareRumItem(rumstate, scanEntry->attnumOrig,
+					   item, &scanEntryBounds->minItem) < 0)
+	{
+		return false;
+	}
+
+	if (checkMaximum &&
+		ItemPointerIsValid(&scanEntryBounds->maxItem.iptr) &&
+		compareRumItem(rumstate, scanEntry->attnumOrig,
+					   item, &scanEntryBounds->maxItem) > 0)
+	{
+		return false;
+	}
+
+	return true;
+}
+
+
+#endif
 
 
 /*
@@ -925,6 +960,159 @@ scan_entry_cmp(const void *p1, const void *p2, void *arg)
 }
 
 
+#if 0
+
+/*
+ * Given a query and set of keys, tries to get the min/max item that could theoretically
+ * match that key in the index.
+ */
+static void
+DetectIndexBounds(RumScanOpaque so, RumState *rumstate,
+				  RumItem *minItem, RumItem *maxItem)
+{
+	int i;
+	bool canPreConsistent;
+	ItemPointerSetInvalid(&minItem->iptr);
+	ItemPointerSetInvalid(&maxItem->iptr);
+	for (i = 0; i < so->nkeys; i++)
+	{
+		RumScanEntry currentEntry;
+		RumScanKey currKey = so->keys[i];
+		bool hasValidMax = false;
+		if (!so->rumstate.hasCanPreConsistentFn[currKey->attnum - 1])
+		{
+			continue;
+		}
+
+		/* Assume that only keys that support "fast scans" and pre-consistent checks
+		 * can participate in faster lookups.
+		 */
+		canPreConsistent = DatumGetBool(FunctionCall6Coll(
+											&rumstate->canPreConsistentFn[currKey->attnum
+																		  -
+																		  1],
+											rumstate->supportCollation[currKey->attnum -
+																	   1],
+											UInt16GetDatum(currKey->strategy),
+											currKey->query,
+											UInt32GetDatum(currKey->nuserentries),
+											PointerGetDatum(currKey->extra_data),
+											PointerGetDatum(currKey->queryValues),
+											PointerGetDatum(currKey->queryCategories)));
+
+		if (!canPreConsistent || currKey->nentries != 1)
+		{
+			continue;
+		}
+
+		currentEntry = currKey->scanEntry[0];
+
+		/* Validate there's nothing that prevents us from accessing start/end */
+		if (currentEntry->isPartialMatch ||
+			currentEntry->isFinished ||
+			!ItemPointerIsValid(&currentEntry->curItem.iptr))
+		{
+			continue;
+		}
+
+		/* We have a valid scan key and entry: capture the minimum item. This is the minimal item
+		 * for this scanKey - now capture the "max" of this across all keys
+		 */
+		if (!ItemPointerIsValid(&minItem->iptr) ||
+			compareRumItem(rumstate, currentEntry->attnum, &currentEntry->curItem,
+						   minItem) > 0)
+		{
+			*minItem = currentEntry->curItem;
+		}
+
+		hasValidMax = currentEntry->nlist > 0;
+		if (hasValidMax && BufferIsValid(currentEntry->buffer))
+		{
+			/* In certain cases, we can have a Posting Tree with 1 page. If we are already
+			 * the right most page then we can consider the max from this page.
+			 */
+			Page page = BufferGetPage(currentEntry->buffer);
+			hasValidMax = RumPageRightMost(page);
+		}
+
+		/* See if we can capture the "max" - this can happen for low selectivity keys (keys that don't have
+		 * a posting tree). For a posting tree while we could capture this, we don't wanna do a page walk
+		 * so we skip that here for now. Across keys, we pick the "min" of the maxes.
+		 */
+		if (hasValidMax &&
+			(!ItemPointerIsValid(&maxItem->iptr) ||
+			 compareRumItem(rumstate, currentEntry->attnum,
+							&currentEntry->list[currentEntry->nlist - 1], maxItem) < 0))
+		{
+			*maxItem = currentEntry->list[currentEntry->nlist - 1];
+		}
+	}
+}
+
+
+static void
+startScanEntryExtended(IndexScanDesc scan, RumState *rumstate, RumScanOpaque so)
+{
+	int i, minPartialMatchIndex = -1;
+	RumItemScanEntryBounds scanEntryBounds;
+	RumItemScanEntryBounds *entryBoundsPtr = NULL;
+
+	/* First start the scan entries for everything that's not range */
+	for (i = 0; i < so->totalentries; i++)
+	{
+		if (!so->entries[i]->isPartialMatch)
+		{
+			startScanEntry(rumstate, so->entries[i], scan->xs_snapshot,
+						   NULL);
+		}
+		else if (minPartialMatchIndex < 0)
+		{
+			minPartialMatchIndex = i;
+		}
+	}
+
+	if (minPartialMatchIndex < 0)
+	{
+		/* if there's no partialMatch we're done */
+		return;
+	}
+
+	/* Now walk the keys and see if there's any information we can get about the "min" row
+	 * or the "max" row that matches.
+	 */
+	ItemPointerSetInvalid(&scanEntryBounds.minItem.iptr);
+	ItemPointerSetInvalid(&scanEntryBounds.maxItem.iptr);
+	DetectIndexBounds(so, rumstate, &scanEntryBounds.minItem, &scanEntryBounds.maxItem);
+
+	/* If we detected at least a min, then let's set it on the partial scan */
+	if (ItemPointerIsValid(&scanEntryBounds.minItem.iptr))
+	{
+		entryBoundsPtr = &scanEntryBounds;
+	}
+	else
+	{
+		entryBoundsPtr = NULL;
+	}
+
+	/* Now initialize partialMatch entries based on the information from the entries already initialized */
+	for (i = minPartialMatchIndex; i < so->totalentries; i++)
+	{
+		if (so->entries[i]->isPartialMatch)
+		{
+			/*
+			 * When initializing it, if we're doing an index intersection with a non-partial match
+			 * and the overall state allows for a tidbitmap instead of a tuplestore.
+			 */
+			startScanEntry(rumstate, so->entries[i], scan->xs_snapshot,
+						   entryBoundsPtr);
+		}
+	}
+}
+
+
+#endif
+
+
 inline static int
 CompareRumKeyScanDirection(RumScanOpaque so, AttrNumber attnum,
 						   Datum leftDatum, RumNullCategory leftCategory,
@@ -1076,6 +1264,117 @@ ValidateIndexEntry(RumScanOpaque so, Datum idatum,
 }
 
 
+/*
+ * This is a copy of index_form_tuple in Postgres,
+ * except we don't try to compress the tuples at all
+ * since this is not destined for storage but the runtime.
+ * Additionally, we reuse the prior indextuple memory to avoid
+ * re-allocating if possible.
+ */
+static IndexTuple
+IndexBuildTupleDynamic(TupleDesc tupleDescriptor,
+					   Datum *values,
+					   bool *isnull,
+					   IndexTuple priorTuple,
+					   MemoryContext context)
+{
+	char *tp;                   /* tuple pointer */
+	IndexTuple tuple;           /* return tuple */
+	Size size,
+		 data_size,
+		 hoff;
+	int i;
+	unsigned short infomask = 0;
+	bool hasnull = false;
+	uint16 tupmask = 0;
+	int numberOfAttributes = tupleDescriptor->natts;
+
+	if (numberOfAttributes > INDEX_MAX_KEYS)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_TOO_MANY_COLUMNS),
+				 errmsg("number of index columns (%d) exceeds limit (%d)",
+						numberOfAttributes, INDEX_MAX_KEYS)));
+	}
+
+	for (i = 0; i < numberOfAttributes; i++)
+	{
+		if (isnull[i])
+		{
+			hasnull = true;
+			break;
+		}
+	}
+
+	if (hasnull)
+	{
+		infomask |= INDEX_NULL_MASK;
+	}
+
+	hoff = IndexInfoFindDataOffset(infomask);
+	data_size = heap_compute_data_size(tupleDescriptor,
+									   values, isnull);
+	size = hoff + data_size;
+	size = MAXALIGN(size);      /* be conservative */
+
+	if (priorTuple != NULL)
+	{
+		Size priorSize = IndexTupleSize(priorTuple);
+		if (priorSize < size)
+		{
+			priorTuple = repalloc(priorTuple, size);
+		}
+
+		tp = (char *) priorTuple;
+		memset(tp, 0, sizeof(IndexTupleData));
+	}
+	else
+	{
+		tp = (char *) MemoryContextAllocZero(context, size);
+	}
+
+	tuple = (IndexTuple) tp;
+	heap_fill_tuple(tupleDescriptor,
+					values,
+					isnull,
+					(char *) tp + hoff,
+					data_size,
+					&tupmask,
+					(hasnull ? (bits8 *) tp + sizeof(IndexTupleData) : NULL));
+
+	/*
+	 * We do this because heap_fill_tuple wants to initialize a "tupmask"
+	 * which is used for HeapTuples, but we want an indextuple infomask. The
+	 * only relevant info is the "has variable attributes" field. We have
+	 * already set the hasnull bit above.
+	 */
+	if (tupmask & HEAP_HASVARWIDTH)
+	{
+		infomask |= INDEX_VAR_MASK;
+	}
+
+	/*
+	 * Here we make sure that the size will fit in the field reserved for it
+	 * in t_info.
+	 */
+	if ((size & INDEX_SIZE_MASK) != size)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("index row requires %zu bytes, maximum size is %zu",
+						size, (Size) INDEX_SIZE_MASK)));
+	}
+
+	infomask |= size;
+
+	/*
+	 * initialize metadata
+	 */
+	tuple->t_info = infomask;
+	return tuple;
+}
+
+
 static void
 PrepareOrderedMatchedEntry(RumScanOpaque so, RumScanEntry entry,
 						   Snapshot snapshot, IndexTuple itup)
@@ -1122,6 +1421,9 @@ PrepareOrderedMatchedEntry(RumScanOpaque so, RumScanEntry entry,
 		bool isnull[INDEX_MAX_KEYS] = { true };
 
 		Datum idatum = rumtuple_get_key(&so->rumstate, itup, &icategory);
+
+		memset(isnull, true, sizeof(bool) *
+			   so->projectIndexTupleData->indexTupleDesc->natts);
 		oldContext = MemoryContextSwitchTo(so->keyCtx);
 
 		so->projectIndexTupleData->indexTupleDatum = FunctionCall4(
@@ -1132,16 +1434,12 @@ PrepareOrderedMatchedEntry(RumScanOpaque so, RumScanEntry entry,
 			so->projectIndexTupleData->indexTupleDatum);
 
 		/* Now form the index datum (freeing the prior one) */
-		if (so->projectIndexTupleData->iscan_tuple)
-		{
-			pfree(so->projectIndexTupleData->iscan_tuple);
-		}
-
 		values[0] = so->projectIndexTupleData->indexTupleDatum;
 		isnull[0] = false;
 
-		so->projectIndexTupleData->iscan_tuple = index_form_tuple(
-			so->projectIndexTupleData->indexTupleDesc, values, isnull);
+		so->projectIndexTupleData->iscan_tuple = IndexBuildTupleDynamic(
+			so->projectIndexTupleData->indexTupleDesc, values, isnull,
+			so->projectIndexTupleData->iscan_tuple, so->keyCtx);
 		MemoryContextSwitchTo(oldContext);
 	}
 
@@ -1261,10 +1559,9 @@ startScanEntryOrderedCore(RumScanOpaque so, RumScanEntry minScanEntry, Snapshot 
 	}
 	so->orderByScanData->orderStack = NULL;
 
-	if (so->orderByScanData->orderByEntryPageCopy)
+	if (so->orderByScanData->isPageValid)
 	{
-		pfree(so->orderByScanData->orderByEntryPageCopy);
-		so->orderByScanData->orderByEntryPageCopy = NULL;
+		so->orderByScanData->isPageValid = false;
 	}
 
 	/* Current entry being considered for ordered scan */
@@ -1434,6 +1731,7 @@ startOrderedScanEntries(IndexScanDesc scan, RumState *rumstate, RumScanOpaque so
 	}
 
 	so->orderByScanData = palloc0(sizeof(RumOrderByScanData));
+	so->orderByScanData->orderByEntryPageCopy = palloc(BLCKSZ);
 	startScanEntryOrderedCore(so, minEntry, scan->xs_snapshot);
 }
 
@@ -2675,6 +2973,7 @@ end:
 static void
 entryFindItem(RumState *rumstate, RumScanEntry entry, RumItem *item, Snapshot snapshot)
 {
+	Page page;
 	if (entry->nlist == 0)
 	{
 		entry->isFinished = true;
@@ -2718,6 +3017,22 @@ entryFindItem(RumState *rumstate, RumScanEntry entry, RumItem *item, Snapshot sn
 
 	/* Check rest of page */
 	LockBuffer(entry->buffer, RUM_SHARE);
+
+	/* If the page got split by the time we get here, then refind the leftmost page */
+	page = BufferGetPage(entry->buffer);
+	while (!RumPageIsLeaf(page) && RumEnableRefindLeafOnEntryNextItem)
+	{
+		RumBtreeData btree;
+		BlockNumber newBlock;
+		Buffer newBuffer;
+		rumPrepareDataScan(&btree, rumstate->index, entry->attnum, rumstate);
+		newBlock = btree.getLeftMostPage(&btree, page);
+		newBuffer = ReadBuffer(btree.index, newBlock);
+		LockBuffer(newBuffer, RUM_SHARE);
+		UnlockReleaseBuffer(entry->buffer);
+		entry->buffer = newBuffer;
+		page = BufferGetPage(entry->buffer);
+	}
 
 	PredicateLockPage(rumstate->index, BufferGetBlockNumber(entry->buffer), snapshot);
 
@@ -3114,6 +3429,14 @@ scanGetItemFull(IndexScanDesc scan, RumItem *advancePast,
 }
 
 
+inline static void
+CopyPageContents(Page sourcePage, Page targetPage)
+{
+	Size pageSize = PageGetPageSize(sourcePage);
+	memcpy(targetPage, sourcePage, pageSize);
+}
+
+
 static bool
 MoveBuffersForOrderedScan(RumScanOpaque so, RumBtree btree)
 {
@@ -3122,12 +3445,13 @@ MoveBuffersForOrderedScan(RumScanOpaque so, RumBtree btree)
 	BlockNumber nextBlockNo = InvalidBlockNumber;
 	IndexTuple boundTuple = NULL;
 	OffsetNumber boundTupleOffset = InvalidOffsetNumber;
-	if (scanData->orderByEntryPageCopy == NULL)
+	if (!scanData->isPageValid)
 	{
 		/* First time after startOrderedScan is called - need to init from current buffer page */
 		LockBuffer(scanData->orderStack->buffer, RUM_SHARE);
 		page = BufferGetPage(scanData->orderStack->buffer);
-		scanData->orderByEntryPageCopy = PageGetTempPageCopy(page);
+		CopyPageContents(page, scanData->orderByEntryPageCopy);
+		scanData->isPageValid = true;
 		LockBuffer(scanData->orderStack->buffer, RUM_UNLOCK);
 		return true;
 	}
@@ -3201,13 +3525,9 @@ MoveBuffersForOrderedScan(RumScanOpaque so, RumBtree btree)
 	}
 
 	/* Found a valid buffer to move to, now copy the buffer into the temp storage */
-	if (scanData->orderByEntryPageCopy)
-	{
-		pfree(scanData->orderByEntryPageCopy);
-	}
-
 	page = BufferGetPage(scanData->orderStack->buffer);
-	scanData->orderByEntryPageCopy = PageGetTempPageCopy(page);
+	CopyPageContents(page, scanData->orderByEntryPageCopy);
+	scanData->isPageValid = true;
 	scanData->orderStack->off =
 		ScanDirectionIsBackward(so->orderScanDirection) ?
 		PageGetMaxOffsetNumber(scanData->orderByEntryPageCopy)
@@ -3268,6 +3588,12 @@ MoveScanForward(RumScanOpaque so, Snapshot snapshot)
 		 */
 		if (rumtuple_get_attrnum(btree.rumstate, itup) != entry->attnum)
 		{
+			if (ScanDirectionIsBackward(so->orderScanDirection))
+			{
+				so->orderByScanData->orderStack->off += so->orderScanDirection;
+				continue;
+			}
+
 			ItemPointerSetInvalid(&entry->curItem.iptr);
 			entry->isFinished = true;
 			return false;

@@ -38,6 +38,7 @@ extern bool EnableNewCompositeIndexOpclass;
 extern bool EnableIndexOrderbyPushdown;
 extern bool EnableDescendingCompositeIndex;
 extern bool EnableIndexOnlyScan;
+extern bool EnableIndexOrderbyPushdownLegacy;
 extern const RumIndexArrayStateFuncs RoaringStateFuncs;
 
 bool RumHasMultiKeyPaths = false;
@@ -78,6 +79,9 @@ typedef struct DocumentDBRumIndexState
 
 
 const char *DocumentdbRumPath = "$libdir/pg_documentdb_extended_rum";
+const char *RumIndexExplainFuncSymbol = "try_explain_rum_index";
+const char *RumIndexOrderedScanInquiryFuncSymbol = "can_rum_index_scan_ordered";
+
 typedef const RumIndexArrayStateFuncs *(*GetIndexArrayStateFuncsFunc)(void);
 
 extern Datum gin_bson_composite_path_extract_query(PG_FUNCTION_ARGS);
@@ -291,7 +295,7 @@ LoadRumRoutine(void)
 	missingOk = true;
 	TryExplainIndexFunc explain_index_func =
 		load_external_function(rumLibPath,
-							   "try_explain_rum_index", !missingOk,
+							   RumIndexExplainFuncSymbol, !missingOk,
 							   ignoreLibFileHandle);
 
 	if (explain_index_func != NULL)
@@ -301,7 +305,7 @@ LoadRumRoutine(void)
 
 	CanOrderInIndexScan scanOrderedFunc =
 		load_external_function(rumLibPath,
-							   "can_rum_index_scan_ordered", !missingOk,
+							   RumIndexOrderedScanInquiryFuncSymbol, !missingOk,
 							   ignoreLibFileHandle);
 	if (scanOrderedFunc != NULL)
 	{
@@ -371,16 +375,20 @@ extension_rumcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		return;
 	}
 
-
 	if (IsCompositeOpFamilyOid(path->indexinfo->relam,
 							   path->indexinfo->opfamily[0]))
 	{
+		bool firstColumnSpecified =
+			EnableIndexOrderbyPushdownLegacy ?
+			CompositePathHasFirstColumnSpecified(path) :
+			TraverseIndexPathForCompositeIndex(path, root);
+
 		/* If this is a composite index, then we need to ensure that
 		 * the first column of the index matches the query path.
 		 * This is because using the composite index would require specifying
 		 * the first column.
 		 */
-		if (!CompositePathHasFirstColumnSpecified(path))
+		if (!firstColumnSpecified)
 		{
 			*indexStartupCost = 0;
 			*indexTotalCost = INFINITY;
@@ -1213,14 +1221,12 @@ extension_rumbuild_core(Relation heapRelation, Relation indexRelation,
 		IndexMultiKeyStatus status = CheckIndexHasArrays(indexRelation, coreRoutine);
 		if (status == IndexMultiKeyStatus_HasArrays)
 		{
-			bool isBuild = true;
-			updateMultikeyStatus(isBuild, indexRelation);
+			updateMultikeyStatus(indexRelation);
 		}
 	}
 	else if (RumHasMultiKeyPaths)
 	{
-		bool isBuild = true;
-		updateMultikeyStatus(isBuild, indexRelation);
+		updateMultikeyStatus(indexRelation);
 	}
 
 	return result;
@@ -1272,8 +1278,7 @@ extension_ruminsert_core(Relation indexRelation,
 
 	if (RumHasMultiKeyPaths)
 	{
-		bool isBuild = false;
-		updateMultikeyStatus(isBuild, indexRelation);
+		updateMultikeyStatus(indexRelation);
 	}
 
 	return result;

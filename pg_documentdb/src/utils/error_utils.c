@@ -13,7 +13,9 @@
 #include <utils/builtins.h>
 #include "utils/documentdb_errors.h"
 #include "utils/version_utils.h"
+#include "utils/error_utils.h"
 
+format_log_hook unredacted_log_emit_hook = NULL;
 
 /* --------------------------------------------------------- */
 /* Top level exports */
