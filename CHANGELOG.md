@@ -1,4 +1,15 @@
-### documentdb v1.107-0 (Unreleased) ###
+### DocumentDB v0.107.0-ferretdb-2.7.0 (November 9, 2025) ###
+
+This version works best with FerretDB v2.7.0.
+(We skipped v2.6.0 to align DocumentDB and FerretDB version numbers.)
+
+Docker images are available
+[in the registry](https://github.com/FerretDB/documentdb/pkgs/container/postgres-documentdb).
+`.deb` packages for Debian and Ubuntu, and `.rpm` packages for Red Hat Enterprise Linux (RHEL) are provided
+[on the release page](https://github.com/FerretDB/documentdb/releases/tag/v0.107.0-ferretdb-2.7.0).
+See installation instructions [in our documentation](https://docs.ferretdb.io/installation/documentdb/).
+
+### documentdb v1.107-0 (August 20, 2025) ###
 - Support sort by _id against the _id index using the enableIndexOrderbyPushdown flag *[Feature]*.
 - Improvements to explain for various scan types *[Feature]*.
 

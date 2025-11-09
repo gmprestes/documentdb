@@ -1,12 +1,12 @@
 module github.com/FerretDB/documentdb/packaging/defineversion
 
-go 1.24
+go 1.25
 
-toolchain go1.24.6
+toolchain go1.25.4
 
 require (
 	github.com/sethvargo/go-githubactions v1.3.1
-	github.com/stretchr/testify v1.10.0
+	github.com/stretchr/testify v1.11.1
 )
 
 require (
