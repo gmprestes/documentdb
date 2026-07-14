@@ -1467,26 +1467,30 @@ CompareStrings(const char *left, uint32_t leftLength, const char *right, uint32_
 		return leftLength - rightLength;
 	}
 
-	int32_t cmp;
-
 	/* simple collation also uses binary comparison */
 	if (!IsCollationApplicable(collationString) ||
 		IsSimpleCollation(collationString))
 	{
-		cmp = memcmp(left, right, minLength);
-	}
-	else
-	{
-		cmp = StringCompareWithCollation(left, leftLength, right, rightLength,
-										 collationString);
+		int32_t cmp = memcmp(left, right, minLength);
+
+		if (cmp != 0)
+		{
+			return cmp;
+		}
+
+		/* memcmp only looked at the common prefix, so the shorter string sorts first */
+		return leftLength - rightLength;
 	}
 
-	if (cmp != 0)
-	{
-		return cmp;
-	}
-
-	return leftLength - rightLength;
+	/*
+	 * The collation compared both strings whole, and its verdict is the answer. Falling
+	 * back to the byte lengths here would undo it: strings a collation calls equal are
+	 * routinely of different byte lengths, because that is the entire point of ignoring
+	 * accents -- "Açúcar" is eight bytes and "Acucar" is six. Case folding survived the
+	 * length check only by accident, since 'A' and 'a' are one byte each.
+	 */
+	return StringCompareWithCollation(left, leftLength, right, rightLength,
+									  collationString);
 }
 
 
