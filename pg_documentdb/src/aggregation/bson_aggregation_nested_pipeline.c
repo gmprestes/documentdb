@@ -2526,9 +2526,22 @@ ProcessLookupCoreWithLet(Query *query, AggregationPipelineBuildContext *context,
 				 *
 				 *     rightDocument @= { "<foreignField>": <value from left> }
 				 *
-				 * @= is in the RUM opclass, and index scans accept runtime keys from
-				 * the outer relation, so the parameterized nested loop becomes an
-				 * index scan per outer row instead of a sequential scan.
+				 * NOT SUFFICIENT ON ITS OWN — off by default. Measured: the plan
+				 * still shows a Seq Scan per outer row, even with enable_seqscan=off,
+				 * because the qual degrades to a Join Filter rather than an index
+				 * qual.
+				 *
+				 * Reason: index selection (opclass/index_support.c) derives the
+				 * queried path from the *constant* bson operand
+				 * (`IsA(secondArg, Const)`) in order to pick which single-path RUM
+				 * index applies. With a runtime value it cannot know the path, so it
+				 * never rewrites the operator into an indexable qual.
+				 *
+				 * Finishing this requires teaching index selection the lookup case:
+				 * the path IS statically known (it is the foreignField, a Const), so
+				 * the index can be chosen at plan time while the *value* arrives at
+				 * scan time as a runtime key (which GIN/RUM extractQuery supports).
+				 * That is the remaining work; this flag is the prerequisite.
 				 */
 				Var *matchVar = makeVar(leftQueryRteIndex, newProjectorAttrNum,
 										BsonTypeId(),
