@@ -1114,12 +1114,23 @@ ValidateIndexForQualifierPathForDollarIn(bytea *indexOptions, const StringView *
 			bson_value_t pathOnlyValue = { 0 };
 			pathOnlyValue.value_type = BSON_TYPE_EOD;
 
+			/*
+			 * GetCompositePathIndexTraverseOption compares paths with strcmp(), so
+			 * the path must be NUL-terminated. The single-path branch above takes an
+			 * explicit length and is fine with a bare StringView; this one is not.
+			 * (The Const call site gets its path from a bson element, which is always
+			 * terminated — which is why this only bites here.)
+			 */
+			char *queryPathCString = pnstrdup(queryPath->string, queryPath->length);
+
 			traverse = GetCompositePathIndexTraverseOption(
 				BSON_INDEX_STRATEGY_DOLLAR_IN, options,
-				queryPath->string,
+				queryPathCString,
 				queryPath->length,
 				&pathOnlyValue,
 				&compositeIndexColumnIgnored);
+
+			pfree(queryPathCString);
 			break;
 		}
 
