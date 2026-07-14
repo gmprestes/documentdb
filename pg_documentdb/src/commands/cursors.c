@@ -395,6 +395,21 @@ CreateAndDrainSingleBatchQuery(const char *cursorName, Query *query,
 	bool closeCursor = true;
 	int cursorOptions = CURSOR_OPT_BINARY | CURSOR_OPT_HOLD;
 
+	/*
+	 * This path drains the whole result in one go through the executor: there is
+	 * no portal to scroll backwards and no cursor left open across statements.
+	 * That is exactly the shape a parallel plan requires, so let the planner
+	 * consider one — without CURSOR_OPT_PARALLEL_OK it never will, and every
+	 * aggregation runs single-threaded no matter how many workers are
+	 * configured.
+	 *
+	 * Read-only queries only: a parallel plan cannot contain writes.
+	 */
+	if (query->commandType == CMD_SELECT && !query->hasModifyingCTE)
+	{
+		cursorOptions |= CURSOR_OPT_PARALLEL_OK;
+	}
+
 	/* Save the context before doing SPI */
 	MemoryContext currentContext = CurrentMemoryContext;
 
