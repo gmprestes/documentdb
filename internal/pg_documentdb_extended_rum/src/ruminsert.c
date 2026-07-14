@@ -19,6 +19,9 @@
 #include "postgres.h"
 
 #include "access/generic_xlog.h"
+#ifdef NEON_SMGR
+#include "storage/smgr.h"
+#endif
 #if PG_VERSION_NUM >= 120000
 #include "access/tableam.h"
 #endif
@@ -826,6 +829,15 @@ rumbuild(Relation heap, Relation index, struct IndexInfo *indexInfo)
 	isParallelIndexCapable = false;
 #endif
 
+#ifdef NEON_SMGR
+	/*
+	 * The RUM build writes pages without WAL and only logs them at the end.
+	 * On Neon a page evicted before that final logging has LSN 0 and cannot be
+	 * reconstructed, so tell the storage manager an unlogged build is starting.
+	 */
+	smgr_start_unlogged_build(RelationGetSmgr(index));
+#endif
+
 	initRumState(&buildstate.rumstate, index);
 	buildstate.rumstate.isBuild = true;
 	buildstate.indtuples = 0;
@@ -941,6 +953,11 @@ rumbuild_serial(Relation heap, Relation index, struct IndexInfo *indexInfo,
 	buildstate->buildStats.nTotalPages = RelationGetNumberOfBlocks(index);
 	rumUpdateStats(index, &buildstate->buildStats, buildstate->rumstate.isBuild);
 
+#ifdef NEON_SMGR
+	/* no more unlogged writes; pages are about to be WAL-logged below */
+	smgr_finish_unlogged_build_phase_1(RelationGetSmgr(index));
+#endif
+
 	/*
 	 * Write index to xlog
 	 */
@@ -960,6 +977,10 @@ rumbuild_serial(Relation heap, Relation index, struct IndexInfo *indexInfo,
 
 		UnlockReleaseBuffer(buffer);
 	}
+
+#ifdef NEON_SMGR
+	smgr_end_unlogged_build(RelationGetSmgr(index));
+#endif
 
 	/*
 	 * Return statistics
@@ -2403,6 +2424,11 @@ rumbuild_parallel(Relation heap, Relation index, struct IndexInfo *indexInfo,
 	buildstate->buildStats.nTotalPages = RelationGetNumberOfBlocks(index);
 	rumUpdateStats(index, &buildstate->buildStats, true);
 
+#ifdef NEON_SMGR
+	/* no more unlogged writes; pages are about to be WAL-logged below */
+	smgr_finish_unlogged_build_phase_1(RelationGetSmgr(index));
+#endif
+
 	/*
 	 * We didn't write WAL records as we built the index, so if WAL-logging is
 	 * required, write all pages to the WAL now.
@@ -2413,6 +2439,10 @@ rumbuild_parallel(Relation heap, Relation index, struct IndexInfo *indexInfo,
 						  0, RelationGetNumberOfBlocks(index),
 						  true);
 	}
+
+#ifdef NEON_SMGR
+	smgr_end_unlogged_build(RelationGetSmgr(index));
+#endif
 
 	/*
 	 * Return statistics
