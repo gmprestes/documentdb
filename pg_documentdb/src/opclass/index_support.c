@@ -458,6 +458,10 @@ OpExprForAggregationStageSupportFunction(Node *supportRequest)
 		return NULL;
 	}
 
+	elog(LOG, "FERON_DBG: support called, funcid=%u lookupOid=%u mergeOid=%u",
+		 req->funcid, BsonDollarLookupJoinFilterFunctionOid(),
+		 BsonDollarMergeJoinFunctionOid());
+
 	Oid operatorOid = -1;
 	if (req->funcid == BsonDollarLookupJoinFilterFunctionOid())
 	{
@@ -498,10 +502,16 @@ OpExprForAggregationStageSupportFunction(Node *supportRequest)
 	bytea *options = req->index->opclassoptions[req->indexcol];
 	if (options == NULL)
 	{
+		elog(LOG, "FERON_DBG: no opclass options for indexcol %d", req->indexcol);
 		return NULL;
 	}
 
-	if (!ValidateIndexForQualifierPathForDollarIn(options, &pathView))
+	bool validated = ValidateIndexForQualifierPathForDollarIn(options, &pathView);
+	elog(LOG, "FERON_DBG: path='%.*s' optionsType=%d validated=%d",
+		 (int) pathView.length, pathView.string,
+		 (int) ((BsonGinIndexOptionsBase *) options)->type, (int) validated);
+
+	if (!validated)
 	{
 		return NULL;
 	}
