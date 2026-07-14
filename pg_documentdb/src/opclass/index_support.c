@@ -2614,6 +2614,168 @@ TraverseIndexPathForCompositeIndex(struct IndexPath *indexPath, struct PlannerIn
 /* --------------------------------------------------------- */
 
 /*
+ * A regex anchored on a literal prefix ("^cafe") matches exactly the strings that
+ * sort between that prefix and the next one, which is a range -- and a range the
+ * composite index can scan in order and abandon as soon as LIMIT is satisfied.
+ * The regex operator cannot: it builds the full bitmap of matching terms before
+ * the LIMIT is applied, so a typeahead query pays for every match in the
+ * collection instead of for the rows it returns.
+ *
+ * Extracts that literal prefix. Returns false when the pattern is not anchored,
+ * when the options rule out a byte-ordered range, or when there is no literal to
+ * anchor on.
+ */
+static bool
+TryGetRegexLiteralPrefix(const char *pattern, uint32_t patternLength,
+						 const char *regexOptions, StringInfo prefix)
+{
+	if (pattern == NULL || patternLength < 2 || pattern[0] != '^')
+	{
+		return false;
+	}
+
+	/* 'i' folds case and 'x' makes whitespace insignificant -- neither survives a
+	 * byte-ordered range. 'm' re-anchors '^' to every line, so the prefix stops
+	 * being a prefix of the value. 's' only changes what '.' matches, and '.' never
+	 * makes it into the literal below.
+	 */
+	for (const char *option = regexOptions;
+		 option != NULL && *option != '\0';
+		 option++)
+	{
+		if (*option == 'i' || *option == 'x' || *option == 'm')
+		{
+			return false;
+		}
+	}
+
+	for (uint32_t i = 1; i < patternLength; i++)
+	{
+		unsigned char currentChar = (unsigned char) pattern[i];
+
+		/* Stay inside ASCII: slicing a UTF-8 sequence in half would corrupt the
+		 * bound, and incrementing its last byte would not give the next string.
+		 */
+		if (currentChar < 0x20 || currentChar >= 0x80)
+		{
+			break;
+		}
+
+		if (strchr(".[]{}()*+?|\\^$", (char) currentChar) != NULL)
+		{
+			/* A quantifier applies to the character *before* it, which is therefore
+			 * not guaranteed to be present: "^abc*" only starts with "ab".
+			 */
+			if ((currentChar == '*' || currentChar == '?' || currentChar == '{') &&
+				prefix->len > 0)
+			{
+				prefix->len--;
+				prefix->data[prefix->len] = '\0';
+			}
+
+			break;
+		}
+
+		appendStringInfoChar(prefix, (char) currentChar);
+	}
+
+	return prefix->len > 0;
+}
+
+
+/*
+ * Rewrites document @~ { "path": "^literal..." } into the equivalent range
+ * [literal, literal + 1). The range is a *superset* of the regex -- the pattern
+ * may constrain the rest of the string -- so the caller must mark the clause lossy
+ * and let the executor recheck the regex against the heap tuple.
+ *
+ * Returns NULL when the pattern has no usable literal prefix, in which case the
+ * caller falls back to the regular regex pushdown.
+ */
+static Expr *
+ProcessRegexPrefixAsRange(Datum queryValue, List *args)
+{
+	pgbson *queryBson = DatumGetPgBson(queryValue);
+	pgbsonelement queryElement;
+	PgbsonToSinglePgbsonElement(queryBson, &queryElement);
+
+	const char *pattern;
+	uint32_t patternLength;
+	const char *regexOptions = NULL;
+
+	if (queryElement.bsonValue.value_type == BSON_TYPE_UTF8)
+	{
+		pattern = queryElement.bsonValue.value.v_utf8.str;
+		patternLength = queryElement.bsonValue.value.v_utf8.len;
+	}
+	else if (queryElement.bsonValue.value_type == BSON_TYPE_REGEX)
+	{
+		pattern = queryElement.bsonValue.value.v_regex.regex;
+		patternLength = pattern == NULL ? 0 : (uint32_t) strlen(pattern);
+		regexOptions = queryElement.bsonValue.value.v_regex.options;
+	}
+	else
+	{
+		return NULL;
+	}
+
+	StringInfoData prefix;
+	initStringInfo(&prefix);
+
+	if (!TryGetRegexLiteralPrefix(pattern, patternLength, regexOptions, &prefix))
+	{
+		pfree(prefix.data);
+		return NULL;
+	}
+
+	/* The upper bound is the prefix with its last byte incremented. Every string
+	 * that starts with the prefix sorts below it, byte for byte, and the prefix is
+	 * ASCII so the increment cannot overflow.
+	 */
+	StringInfoData upperBound;
+	initStringInfo(&upperBound);
+	appendBinaryStringInfo(&upperBound, prefix.data, prefix.len);
+	upperBound.data[upperBound.len - 1]++;
+
+	bson_value_t minValue = { 0 };
+	minValue.value_type = BSON_TYPE_UTF8;
+	minValue.value.v_utf8.str = prefix.data;
+	minValue.value.v_utf8.len = (uint32_t) prefix.len;
+
+	bson_value_t maxValue = { 0 };
+	maxValue.value_type = BSON_TYPE_UTF8;
+	maxValue.value.v_utf8.str = upperBound.data;
+	maxValue.value.v_utf8.len = (uint32_t) upperBound.len;
+
+	pgbson_writer writer;
+	pgbson_writer rangeWriter;
+	PgbsonWriterInit(&writer);
+	PgbsonWriterStartDocument(&writer, queryElement.path, queryElement.pathLength,
+							  &rangeWriter);
+	PgbsonWriterAppendValue(&rangeWriter, "min", 3, &minValue);
+	PgbsonWriterAppendValue(&rangeWriter, "max", 3, &maxValue);
+	PgbsonWriterAppendBool(&rangeWriter, "minInclusive", 12, true);
+	PgbsonWriterAppendBool(&rangeWriter, "maxInclusive", 12, false);
+	PgbsonWriterEndDocument(&writer, &rangeWriter);
+
+	Const *rangeConst = makeConst(BsonTypeId(), -1, InvalidOid, -1,
+								  PointerGetDatum(PgbsonWriterGetPgbson(&writer)),
+								  false, false);
+
+	OpExpr *rangeExpr = (OpExpr *) make_opclause(BsonRangeMatchOperatorOid(), BOOLOID,
+												 false, linitial(args),
+												 (Expr *) rangeConst, InvalidOid,
+												 InvalidOid);
+	rangeExpr->opfuncid = BsonRangeMatchFunctionId();
+
+	pfree(prefix.data);
+	pfree(upperBound.data);
+
+	return (Expr *) rangeExpr;
+}
+
+
+/*
  * Inspects an input SupportRequestIndexCondition and associated FuncExpr
  * and validates whether it is satisfied by the index specified in the request.
  * If it is, then returns a new OpExpr for the condition.
@@ -2702,6 +2864,20 @@ HandleSupportRequestCondition(SupportRequestIndexCondition *req)
 											operator->indexStrategy))
 		{
 			return NULL;
+		}
+
+		if (operator->indexStrategy == BSON_INDEX_STRATEGY_DOLLAR_REGEX &&
+			IsCompositeOpFamilyOid(req->index->relam, operatorFamily))
+		{
+			Expr *rangeExpr = ProcessRegexPrefixAsRange(queryValue, args);
+			if (rangeExpr != NULL)
+			{
+				/* The range bounds the prefix only; the rest of the pattern still
+				 * has to be checked against the heap tuple.
+				 */
+				req->lossy = true;
+				return rangeExpr;
+			}
 		}
 
 		Expr *finalExpression =
