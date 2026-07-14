@@ -2166,6 +2166,54 @@ ProcessOrderByStatements(PlannerInfo *root,
 }
 
 
+/*
+ * The composite index column of a qualifier is identified by the *path* it
+ * queries, which is normally read from the constant BSON operand of the qual
+ * (e.g. document @= '{ "a": 1 }' queries path "a").
+ *
+ * The aggregation-stage join filters ($lookup / $merge) are different: the
+ * value they compare against comes from the outer side of the join, so it is
+ * only known at runtime and the rewritten qual carries a non-Const operand.
+ * The queried path, however, *is* statically known: the join filter takes it
+ * as a Const text argument, which is precisely why it exists as a 3-argument
+ * function.
+ *
+ * Recover the path from the original (pre-rewrite) clause so that such quals
+ * can still be matched to a composite index column. Returns NULL when the
+ * clause is not an aggregation-stage join filter, in which case the qual has
+ * no statically known path and cannot be pushed down.
+ */
+static const char *
+GetStaticQueryPathForRuntimeQual(RestrictInfo *originalClause)
+{
+	if (originalClause == NULL || originalClause->clause == NULL ||
+		!IsA(originalClause->clause, FuncExpr))
+	{
+		return NULL;
+	}
+
+	FuncExpr *funcExpr = (FuncExpr *) originalClause->clause;
+	if (funcExpr->funcid != BsonDollarLookupJoinFilterFunctionOid() &&
+		funcExpr->funcid != BsonDollarMergeJoinFunctionOid())
+	{
+		return NULL;
+	}
+
+	if (list_length(funcExpr->args) != 3)
+	{
+		return NULL;
+	}
+
+	Node *pathNode = lthird(funcExpr->args);
+	if (!IsA(pathNode, Const) || ((Const *) pathNode)->constisnull)
+	{
+		return NULL;
+	}
+
+	return TextDatumGetCString(((Const *) pathNode)->constvalue);
+}
+
+
 bool
 TraverseIndexPathForCompositeIndex(struct IndexPath *indexPath, struct PlannerInfo *root)
 {
@@ -2212,20 +2260,33 @@ TraverseIndexPathForCompositeIndex(struct IndexPath *indexPath, struct PlannerIn
 
 			OpExpr *expr = (OpExpr *) qual->clause;
 			Expr *queryVal = lsecond(expr->args);
-			if (!IsA(queryVal, Const))
+
+			pgbsonelement queryElement = { 0 };
+			const char *queryPath;
+			if (IsA(queryVal, Const))
 			{
-				/* If the query value is not a constant, we can't push down */
-				continue;
+				Const *queryConst = (Const *) queryVal;
+				pgbson *queryBson = DatumGetPgBson(queryConst->constvalue);
+
+				PgbsonToSinglePgbsonElement(queryBson, &queryElement);
+				queryPath = queryElement.path;
+			}
+			else
+			{
+				/* The query value is only known at runtime (a $lookup/$merge join
+				 * filter, whose value comes from the outer side of the join). The
+				 * queried path is still static, so the qual can be pushed down to
+				 * the index with the value supplied as a runtime scan key.
+				 */
+				queryPath = GetStaticQueryPathForRuntimeQual(clause->rinfo);
+				if (queryPath == NULL)
+				{
+					continue;
+				}
 			}
 
-			Const *queryConst = (Const *) queryVal;
-			pgbson *queryBson = DatumGetPgBson(queryConst->constvalue);
-
-			pgbsonelement queryElement;
-			PgbsonToSinglePgbsonElement(queryBson, &queryElement);
-
 			int8_t sortDirection;
-			int columnNumber = GetCompositeOpClassColumnNumber(queryElement.path,
+			int columnNumber = GetCompositeOpClassColumnNumber(queryPath,
 															   indexPath->indexinfo->
 															   opclassoptions[0],
 															   &sortDirection);
@@ -2295,7 +2356,7 @@ TraverseIndexPathForCompositeIndex(struct IndexPath *indexPath, struct PlannerIn
 			}
 
 			pathSortOrders[columnNumber] = currentPathKeyIsReverseSort ? -1 : 1;
-			queryOrderPaths[columnNumber] = queryElement.path;
+			queryOrderPaths[columnNumber] = queryPath;
 			minOrderByColumn = Min(minOrderByColumn, columnNumber);
 			maxOrderByColumn = Max(maxOrderByColumn, columnNumber);
 			orderbyIndexClauses = lappend(orderbyIndexClauses, clause);
