@@ -78,7 +78,9 @@ bool EnableNewCompositeIndexOpclass = DEFAULT_ENABLE_NEW_COMPOSITE_INDEX_OPCLASS
 bool DefaultUseCompositeOpClass = DEFAULT_USE_NEW_COMPOSITE_INDEX_OPCLASS;
 
 #define DEFAULT_ENABLE_INDEX_ORDERBY_PUSHDOWN false
+#define DEFAULT_ENABLE_LOOKUP_JOIN_INDEX_PUSHDOWN true
 bool EnableIndexOrderbyPushdown = DEFAULT_ENABLE_INDEX_ORDERBY_PUSHDOWN;
+bool EnableLookupJoinIndexPushdown = DEFAULT_ENABLE_LOOKUP_JOIN_INDEX_PUSHDOWN;
 
 #define DEFAULT_ENABLE_INDEX_ORDERBY_PUSHDOWN_LEGACY false
 bool EnableIndexOrderbyPushdownLegacy = DEFAULT_ENABLE_INDEX_ORDERBY_PUSHDOWN_LEGACY;
@@ -433,6 +435,15 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 			"Whether or not to use the new elemMatch index pushdown logic."),
 		NULL, &UseNewElemMatchIndexPushdown,
 		DEFAULT_USE_NEW_ELEMMATCH_INDEX_PUSHDOWN,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enableLookupJoinIndexPushdown", newGucPrefix),
+		gettext_noop(
+			"Whether a $lookup on a non-_id field emits an indexable @= qual instead "
+			"of an opaque boolean join filter. Without it every outer row drives a "
+			"sequential scan of the foreign collection."),
+		NULL, &EnableLookupJoinIndexPushdown, DEFAULT_ENABLE_LOOKUP_JOIN_INDEX_PUSHDOWN,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(

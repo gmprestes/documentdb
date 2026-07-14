@@ -51,6 +51,7 @@ const int MaximumLookupPipelineDepth = 20;
 extern bool EnableLookupIdJoinOptimizationOnCollation;
 extern bool EnableNowSystemVariable;
 extern bool EnableLookupInnerJoin;
+extern bool EnableLookupJoinIndexPushdown;
 
 /*
  * Struct having parsed view of the
@@ -2505,6 +2506,39 @@ ProcessLookupCoreWithLet(Query *query, AggregationPipelineBuildContext *context,
 				List *inArgs = list_make2(copyObject(rightObjectIdEntry->expr), matchVar);
 				inOperator->args = inArgs;
 				inClause = (Node *) inOperator;
+			}
+			else if (EnableLookupJoinIndexPushdown)
+			{
+				/*
+				 * Join on a regular (non-_id) field.
+				 *
+				 * The historical path below calls bson_dollar_lookup_join_filter(),
+				 * a boolean function over the whole document. The planner cannot see
+				 * through it, so no index qual can be derived: every outer row drives
+				 * a sequential scan of the foreign collection. On a 160k-document
+				 * child collection that is ~2.5s per outer row — a 20-row $lookup
+				 * takes ~49s, while the same join written by hand with $in takes 12ms.
+				 *
+				 * The left side already projects the filter in exactly the shape the
+				 * match operator expects — bson_dollar_lookup_extract_filter_expression()
+				 * yields { "<foreignField>": <value> } — which is the same shape a
+				 * find() filter has. So emit the real operator:
+				 *
+				 *     rightDocument @= { "<foreignField>": <value from left> }
+				 *
+				 * @= is in the RUM opclass, and index scans accept runtime keys from
+				 * the outer relation, so the parameterized nested loop becomes an
+				 * index scan per outer row instead of a sequential scan.
+				 */
+				Var *matchVar = makeVar(leftQueryRteIndex, newProjectorAttrNum,
+										BsonTypeId(),
+										-1,
+										InvalidOid, matchLevelsUp);
+				inClause = (Node *) make_opclause(BsonEqualMatchOperatorId(), BOOLOID,
+												  false,
+												  (Expr *) copyObject(rightVar),
+												  (Expr *) matchVar,
+												  InvalidOid, InvalidOid);
 			}
 			else
 			{
