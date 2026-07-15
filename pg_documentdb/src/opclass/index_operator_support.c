@@ -403,6 +403,15 @@ PushExprToIndex(SupportRequestIndexCondition *supportRequest)
 	pgbsonelement exprElement = { 0 };
 	bson_iter_t exprIter;
 	PgbsonToSinglePgbsonElement(exprBson, &exprElement);
+
+	/* $expr accepts scalar expressions (constants, field paths); only a
+	 * document can carry operator conditions we know how to push down.
+	 */
+	if (exprElement.bsonValue.value_type != BSON_TYPE_DOCUMENT)
+	{
+		return NULL;
+	}
+
 	BsonValueInitIterator(&exprElement.bsonValue, &exprIter);
 	bytea *indexOptions = supportRequest->index->opclassoptions[supportRequest->indexcol];
 
