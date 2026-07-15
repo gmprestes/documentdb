@@ -387,10 +387,13 @@ FillPgbsonElementUnsafe(uint8_t *data, uint32_t data_len, pgbsonelement *element
 				return false;
 			}
 
-			memcpy(&element->bsonValue.value.v_timestamp.timestamp, data,
+			/* On the wire a timestamp is a little-endian uint64 with the
+			 * increment in the low 32 bits and the seconds in the high 32
+			 * bits, so the increment comes first in the buffer. */
+			memcpy(&element->bsonValue.value.v_timestamp.increment, data,
 				   sizeof(uint32_t));
 			data += 4;
-			memcpy(&element->bsonValue.value.v_timestamp.increment, data,
+			memcpy(&element->bsonValue.value.v_timestamp.timestamp, data,
 				   sizeof(uint32_t));
 			return true;
 		}
