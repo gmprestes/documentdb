@@ -27,6 +27,13 @@
 #include <aggregation/bson_aggregation_pipeline.h>
 #include "aggregation/aggregation_commands.h"
 #include "infrastructure/cursor_store.h"
+#include <common/hashfn.h>
+#include <utils/acl.h>
+#include <utils/builtins.h>
+#include <utils/ruleutils.h>
+#include <utils/resowner.h>
+#include <access/xlog.h>
+#include "utils/query_utils.h"
 
 
 extern bool EnableNowSystemVariable;
@@ -724,6 +731,148 @@ GenerateGetMoreQuery(text *database, pgbson *getMoreSpec, pgbson *continuationSp
 }
 
 
+extern bool EnableAutoGroupKeyStatistics;
+
+/*
+ * Whether a field path can be embedded verbatim in the JSON expression
+ * spec of a CREATE STATISTICS statement.
+ */
+static bool
+IsFieldPathSafeForStatsSpec(const char *fieldPath)
+{
+	for (const unsigned char *c = (const unsigned char *) fieldPath; *c != '\0'; c++)
+	{
+		if (*c < 0x20 || *c == '"' || *c == '\\')
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * Auto-creates extended statistics for plain field paths used as $group
+ * keys. Without them the planner cannot estimate the group count of an
+ * expression over bson, guesses rows/3 and never picks partial parallel
+ * aggregation — the whole $group runs in a single process. MongoDB is
+ * schema-free, so nobody is going to declare these by hand: the first
+ * $group on a field pays one CREATE STATISTICS + ANALYZE, every later
+ * one gets the parallel plan.
+ *
+ * Best-effort by design: any failure rolls back the subtransaction and
+ * the query proceeds on the unassisted plan.
+ */
+static void
+EnsureGroupKeyStatistics(List *candidates)
+{
+	if (candidates == NIL || !EnableAutoGroupKeyStatistics)
+	{
+		return;
+	}
+
+	/* No DDL on replicas, in read-only transactions, or inside a client
+	 * transaction block (a multi-document transaction should not take DDL
+	 * locks as a side effect of a read). */
+	if (XactReadOnly || RecoveryInProgress() || IsTransactionBlock())
+	{
+		return;
+	}
+
+	Oid adminRoleOid = get_role_oid(ApiAdminRole, true);
+	if (!OidIsValid(adminRoleOid))
+	{
+		return;
+	}
+
+	ListCell *cell;
+	foreach(cell, candidates)
+	{
+		GroupKeyStatsCandidate *candidate = lfirst(cell);
+		if (!IsFieldPathSafeForStatsSpec(candidate->fieldPath))
+		{
+			continue;
+		}
+
+		uint32 pathHash = hash_bytes((const unsigned char *) candidate->fieldPath,
+									 strlen(candidate->fieldPath));
+		StringInfo statName = makeStringInfo();
+		appendStringInfo(statName, "gks_%llu_%08x",
+						 (unsigned long long) candidate->collectionId, pathHash);
+
+		StringInfo query = makeStringInfo();
+		appendStringInfo(query,
+						 "SELECT 1 FROM pg_statistic_ext WHERE stxname = %s"
+						 " AND stxnamespace = %s::regnamespace",
+						 quote_literal_cstr(statName->data),
+						 quote_literal_cstr(ApiDataSchemaName));
+
+		bool isNull = true;
+		bool readOnly = true;
+		ExtensionExecuteQueryViaSPI(query->data, readOnly, SPI_OK_SELECT, &isNull);
+		if (!isNull)
+		{
+			continue;
+		}
+
+		/* The data tables belong to the extension admin; run the DDL as it.
+		 * A subtransaction keeps a failure (concurrent creation, permission,
+		 * lock timeout) from poisoning the user's query. */
+		MemoryContext oldContext = CurrentMemoryContext;
+		ResourceOwner oldOwner = CurrentResourceOwner;
+		Oid savedUserId = InvalidOid;
+		int savedSecurityContext = 0;
+		GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
+
+		BeginInternalSubTransaction(NULL);
+		PG_TRY();
+		{
+			SetUserIdAndSecContext(adminRoleOid, SECURITY_LOCAL_USERID_CHANGE);
+
+			resetStringInfo(query);
+			appendStringInfo(query,
+							 "CREATE STATISTICS IF NOT EXISTS %s.%s ON "
+							 "(%s.bson_expression_get(document, %s::%s.bson, true)) "
+							 "FROM %s.documents_%llu",
+							 ApiDataSchemaName, quote_identifier(statName->data),
+							 ApiCatalogSchemaName,
+							 quote_literal_cstr(psprintf("{ \"\" : \"$%s\" }",
+														 candidate->fieldPath)),
+							 CoreSchemaName, ApiDataSchemaName,
+							 (unsigned long long) candidate->collectionId);
+			readOnly = false;
+			ExtensionExecuteQueryViaSPI(query->data, readOnly, SPI_OK_UTILITY, &isNull);
+
+			resetStringInfo(query);
+			appendStringInfo(query, "ANALYZE %s.documents_%llu",
+							 ApiDataSchemaName,
+							 (unsigned long long) candidate->collectionId);
+			ExtensionExecuteQueryViaSPI(query->data, readOnly, SPI_OK_UTILITY, &isNull);
+
+			SetUserIdAndSecContext(savedUserId, savedSecurityContext);
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(oldContext);
+			CurrentResourceOwner = oldOwner;
+		}
+		PG_CATCH();
+		{
+			MemoryContextSwitchTo(oldContext);
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(oldContext);
+			CurrentResourceOwner = oldOwner;
+			SetUserIdAndSecContext(savedUserId, savedSecurityContext);
+
+			ereport(DEBUG1, (errmsg(
+								 "auto group-key statistics skipped for collection %llu",
+								 (unsigned long long) candidate->collectionId)));
+		}
+		PG_END_TRY();
+	}
+}
+
+
 /*
  * Given a pre-built query (for find/aggregate) handles the cursor request
  * and builds a response for the first page.
@@ -732,6 +881,8 @@ static Datum
 HandleFirstPageRequest(pgbson *querySpec, int64_t cursorId,
 					   QueryData *queryData, QueryKind queryKind, Query *query)
 {
+	EnsureGroupKeyStatistics(queryData->groupKeyStatsCandidates);
+
 	pgbson_writer writer;
 	pgbson_writer cursorDoc;
 	pgbson_array_writer arrayWriter;

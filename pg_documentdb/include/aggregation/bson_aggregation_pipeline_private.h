@@ -179,6 +179,12 @@ typedef struct
 
 	/*Parent Stage Name*/
 	ParentStageName parentStageName;
+
+	/* Simple field paths used as $group keys over a base collection
+	 * (list of GroupKeyStatsCandidate). The command layer uses them to
+	 * auto-create extended statistics so the planner can estimate the
+	 * group count and pick partial parallel aggregation. */
+	List *groupKeyStatsCandidates;
 } AggregationPipelineBuildContext;
 
 

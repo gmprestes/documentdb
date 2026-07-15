@@ -82,7 +82,25 @@ typedef struct
 	 * The time system variables ($$NOW, $$CLUSTER_TIME).
 	 */
 	TimeSystemVariables timeSystemVariables;
+
+	/* Simple field paths used as $group keys over a base collection
+	 * (list of GroupKeyStatsCandidate), collected during pipeline build. */
+	List *groupKeyStatsCandidates;
 } QueryData;
+
+
+/*
+ * A $group key eligible for automatic extended statistics: a plain
+ * field path over a physical collection.
+ */
+typedef struct GroupKeyStatsCandidate
+{
+	/* The collection whose documents_<id> table the key groups over */
+	uint64 collectionId;
+
+	/* The field path, without the leading '$' */
+	const char *fieldPath;
+} GroupKeyStatsCandidate;
 
 
 Query * GenerateFindQuery(text *database, pgbson *findSpec, QueryData *queryData,

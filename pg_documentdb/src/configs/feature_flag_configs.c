@@ -192,6 +192,18 @@ bool EnablePrimaryKeyCursorScan = DEFAULT_ENABLE_PRIMARY_KEY_CURSOR_SCAN;
 #define DEFAULT_USE_FILE_BASED_PERSISTED_CURSORS false
 bool UseFileBasedPersistedCursors = DEFAULT_USE_FILE_BASED_PERSISTED_CURSORS;
 
+/* On the first $group over a plain field path, auto-create extended
+ * statistics on the group-key expression so the planner can estimate the
+ * group count and choose partial parallel aggregation. */
+#define DEFAULT_ENABLE_AUTO_GROUP_KEY_STATISTICS true
+bool EnableAutoGroupKeyStatistics = DEFAULT_ENABLE_AUTO_GROUP_KEY_STATISTICS;
+
+/* parallel_workers reloption stamped on new collection data tables. The
+ * planner sizes workers from the heap, which excludes TOAST — where the
+ * documents actually live — so it undersizes badly. <= 0 leaves default. */
+#define DEFAULT_COLLECTION_PARALLEL_WORKERS 4
+int CollectionTableParallelWorkers = DEFAULT_COLLECTION_PARALLEL_WORKERS;
+
 #define DEFAULT_ENABLE_CONVERSION_STREAMABLE_SINGLE_BATCH true
 bool EnableConversionStreamableToSingleBatch =
 	DEFAULT_ENABLE_CONVERSION_STREAMABLE_SINGLE_BATCH;
@@ -459,6 +471,22 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 			"Whether or not to use file based persisted cursors."),
 		NULL, &UseFileBasedPersistedCursors,
 		DEFAULT_USE_FILE_BASED_PERSISTED_CURSORS,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enableAutoGroupKeyStatistics", newGucPrefix),
+		gettext_noop(
+			"Auto-create extended statistics for plain field paths used as $group keys."),
+		NULL, &EnableAutoGroupKeyStatistics,
+		DEFAULT_ENABLE_AUTO_GROUP_KEY_STATISTICS,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		psprintf("%s.collectionTableParallelWorkers", newGucPrefix),
+		gettext_noop(
+			"parallel_workers reloption stamped on new collection data tables (<= 0 leaves the default)."),
+		NULL, &CollectionTableParallelWorkers,
+		DEFAULT_COLLECTION_PARALLEL_WORKERS, -1, 64,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(

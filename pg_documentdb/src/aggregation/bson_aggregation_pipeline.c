@@ -1439,6 +1439,8 @@ GenerateAggregationQuery(text *database, pgbson *aggregationSpec, QueryData *que
 									 &context);
 	}
 
+	queryData->groupKeyStatsCandidates = context.groupKeyStatsCandidates;
+
 	return query;
 }
 
@@ -5924,6 +5926,26 @@ HandleGroup(const bson_value_t *existingValue, Query *query,
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION15955),
 						errmsg("_id is missing from group specification")));
+	}
+
+	/* A plain field path grouping over a physical collection is a candidate
+	 * for automatic extended statistics: without an estimate of the group
+	 * count the planner never picks partial parallel aggregation. Collected
+	 * here, created by the command layer (this function also runs in
+	 * planner/view contexts where DDL is off-limits). */
+	if (idValue.value_type == BSON_TYPE_UTF8 &&
+		idValue.value.v_utf8.len > 1 &&
+		idValue.value.v_utf8.str[0] == '$' &&
+		idValue.value.v_utf8.str[1] != '$' &&
+		context->mongoCollection != NULL &&
+		context->nestedPipelineLevel == 0)
+	{
+		GroupKeyStatsCandidate *candidate = palloc(sizeof(GroupKeyStatsCandidate));
+		candidate->collectionId = context->mongoCollection->collectionId;
+		candidate->fieldPath = pnstrdup(idValue.value.v_utf8.str + 1,
+										idValue.value.v_utf8.len - 1);
+		context->groupKeyStatsCandidates =
+			lappend(context->groupKeyStatsCandidates, candidate);
 	}
 
 	pgbson *groupValue = BsonValueToDocumentPgbson(&idValue);

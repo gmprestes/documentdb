@@ -25,6 +25,7 @@
 
 extern bool EnableNativeColocation;
 extern bool EnableDataTableWithoutCreationTime;
+extern int CollectionTableParallelWorkers;
 
 static bool CanColocateAtDatabaseLevel(text *databaseDatum);
 static const char * CreatePostgresDataTable(uint64_t collectionId,
@@ -230,6 +231,15 @@ CreatePostgresDataTable(uint64_t collectionId, const char *colocateWith, const
 	else
 	{
 		appendStringInfo(createTableStringInfo, ", creation_time timestamptz)");
+	}
+
+	/* The planner sizes parallel workers from the heap, but the documents
+	 * live in TOAST, which it does not count — a multi-hundred-MB collection
+	 * looks tiny and gets undersized. Stamp a saner worker count up front. */
+	if (CollectionTableParallelWorkers > 0)
+	{
+		appendStringInfo(createTableStringInfo, " WITH (parallel_workers = %d)",
+						 CollectionTableParallelWorkers);
 	}
 
 	bool readOnly = false;
