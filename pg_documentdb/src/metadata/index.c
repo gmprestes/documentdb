@@ -2594,13 +2594,17 @@ SerializeIndexSpec(const IndexSpec *indexSpec, bool isGetIndexes,
 				}
 				else if (IsOptionsKeyOrderedIndex(keyView.string))
 				{
-					/* TODO: We should just write this if the value is != ShouldUseCompositeOpClassByDefault
-					 * but we're leaving it here during the transition period of this being enabled by default in
-					 * some cases.*/
+					/* Only surface this when it differs from the server default:
+					 * an index that is ordered merely because of the default GUC
+					 * must list exactly like the reference response, which has no
+					 * storageEngine document. */
 					bool value = BsonValueAsBool(bson_iter_value(&optionsIter));
-					PgbsonWriterAppendBool(&storageEngineOptionsWriter,
-										   "enableOrderedIndex", 18,
-										   value);
+					if (value != ShouldUseCompositeOpClassByDefault())
+					{
+						PgbsonWriterAppendBool(&storageEngineOptionsWriter,
+											   "enableOrderedIndex", 18,
+											   value);
+					}
 				}
 				else
 				{
