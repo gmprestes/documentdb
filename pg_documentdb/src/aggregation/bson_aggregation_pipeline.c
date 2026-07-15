@@ -5231,6 +5231,55 @@ GetDocumentExprForGroupAccumulatorValue(const bson_value_t *accumulatorValue,
 
 
 /*
+ * Whether an aggregation expression references any variable ("$$NOW",
+ * "$$CLUSTER_TIME", let variables, $map/$filter locals, ...).
+ *
+ * The top-level variable spec embeds the current timestamp, so it is a
+ * different Const on every query. Passing it to bson_expression_get when
+ * the expression cannot possibly read a variable makes the group key
+ * expression unique per execution: extended statistics created on the
+ * expression never match, the planner falls back to guessing the group
+ * count, and a full-collection $group loses partial parallel aggregation.
+ * Conservative on purpose: any "$$"-prefixed string (even inside $literal)
+ * keeps the variable spec.
+ */
+static bool
+BsonValueReferencesVariables(const bson_value_t *value)
+{
+	switch (value->value_type)
+	{
+		case BSON_TYPE_UTF8:
+		{
+			return value->value.v_utf8.len >= 2 &&
+				   value->value.v_utf8.str[0] == '$' &&
+				   value->value.v_utf8.str[1] == '$';
+		}
+
+		case BSON_TYPE_DOCUMENT:
+		case BSON_TYPE_ARRAY:
+		{
+			bson_iter_t iter;
+			BsonValueInitIterator(value, &iter);
+			while (bson_iter_next(&iter))
+			{
+				if (BsonValueReferencesVariables(bson_iter_value(&iter)))
+				{
+					return true;
+				}
+			}
+
+			return false;
+		}
+
+		default:
+		{
+			return false;
+		}
+	}
+}
+
+
+/*
  * Simple helper method that has logic to insert a Group accumulator to a query.
  * This adds the group aggregate to the TargetEntry (for projection)
  * and also adds the necessary data to the bson_repath_and_build arguments.
@@ -5251,7 +5300,7 @@ AddSimpleGroupAccumulator(Query *query, const bson_value_t *accumulatorValue,
 								 true);
 	List *groupArgs;
 	Oid functionId;
-	if (variableSpec != NULL)
+	if (variableSpec != NULL && BsonValueReferencesVariables(accumulatorValue))
 	{
 		groupArgs = list_make4(documentExpr, constValue, trueConst, variableSpec);
 		functionId = BsonExpressionGetWithLetFunctionOid();
@@ -5888,7 +5937,7 @@ HandleGroup(const bson_value_t *existingValue, Query *query,
 	Oid bsonExpressionGetFunction;
 	Expr *groupIdDocumentExpr = GetDocumentExprForGroupAccumulatorValue(&idValue,
 																		origEntry->expr);
-	if (context->variableSpec != NULL)
+	if (context->variableSpec != NULL && BsonValueReferencesVariables(&idValue))
 	{
 		bsonExpressionGetFunction = BsonExpressionGetWithLetFunctionOid();
 		groupArgs = list_make4(groupIdDocumentExpr, MakeBsonConst(groupValue),
