@@ -598,6 +598,18 @@ CreateAndDrainPersistedQueryWithFiles(const char *cursorName, Query *query,
 	/* Set up cursor flags */
 	int cursorOptions = CURSOR_OPT_BINARY | CURSOR_OPT_HOLD;
 
+	/*
+	 * Like the single-batch path, this one drains the entire result through
+	 * the executor in one run (the continuation pages go to a file, not to a
+	 * suspended portal), which is the shape a parallel plan requires. Without
+	 * CURSOR_OPT_PARALLEL_OK a blocking $group runs single-threaded no matter
+	 * how many workers are configured.
+	 */
+	if (query->commandType == CMD_SELECT && !query->hasModifyingCTE)
+	{
+		cursorOptions |= CURSOR_OPT_PARALLEL_OK;
+	}
+
 	/* Save the context before doing SPI */
 	MemoryContext currentContext = CurrentMemoryContext;
 
