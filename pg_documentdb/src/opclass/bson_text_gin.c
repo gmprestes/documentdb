@@ -322,7 +322,7 @@ GetUnaccentFunctionOid(void)
  * Applies version-3 diacritic folding to a UTF-8 string via unaccent().
  * Returns a palloc'd text datum's payload; sets *foldedLength.
  */
-static const char *
+static char *
 ApplyDiacriticFolding(const char *str, uint32_t length, uint32_t *foldedLength)
 {
 	Datum input = PointerGetDatum(cstring_to_text_with_len(str, length));
@@ -591,8 +591,12 @@ BsonTextGenerateTSQueryCore(const bson_value_t *queryValue, bytea *indexOptions,
 	 * folded index terms (see GenerateTsVectorWithOptions). */
 	const char *searchStr = searchValue.value.v_utf8.str;
 	uint32_t searchLen = searchValue.value.v_utf8.len;
-	if (indexOptions != NULL)
+	if (indexOptions != NULL &&
+		VARSIZE_ANY(indexOptions) >= sizeof(BsonGinTextPathOptions))
 	{
+		/* Size guard: options blobs serialized before the textversion
+		 * reloption existed are shorter; reading past them is unsafe and
+		 * such indexes are version 2 by definition. */
 		BsonGinTextPathOptions *textOptions =
 			(BsonGinTextPathOptions *) indexOptions;
 		if (textOptions->textIndexVersion >= 3)
@@ -1444,7 +1448,7 @@ GenerateTsVectorWithOptions(pgbson *document,
 
 			/* Version 3: fold diacritics so index terms match v3's
 			 * diacritic-insensitive semantics (query side folds too). */
-			const char *textStr = term.element.bsonValue.value.v_utf8.str;
+			char *textStr = term.element.bsonValue.value.v_utf8.str;
 			uint32_t textLen = term.element.bsonValue.value.v_utf8.len;
 			if (options->textIndexVersion >= 3)
 			{
