@@ -1,86 +1,99 @@
 # Parallel index builds for pg_documentdb_extended_rum
 
-Status: DESIGN — implementation tracked on branch `feron-parallel-rum`.
-Target: upstream PR to microsoft/documentdb once validated.
+Status: DESIGN (revised 29/jul/2026 after reading the shipped code).
+Branch: `feron-parallel-rum`.
 
-## Problem
+## The situation, corrected
 
-Every regular DocumentDB index (single-field, compound, composite op-class)
-is built by the `extended_rum` access method, and its build is single-core:
-one backend scans the whole heap, accumulates entries in an in-memory
-red-black tree bounded by `maintenance_work_mem`, and flushes sorted batches
-into the index. On multi-GiB collections the build takes many minutes
-(measured: 8.8M docs / 7.8GB ≈ 520s via CONCURRENTLY on 2 vCPU) while other
-cores sit idle. B-tree got parallel builds in PG11; GIN — the AM RUM derives
-from — got them in **PostgreSQL 18** (`ginbuild.c` parallel path). RUM never
-did.
+An earlier version of this document proposed porting PostgreSQL 18's parallel
+GIN build to RUM. **That work is unnecessary: `pg_documentdb_extended_rum`
+already ships a complete parallel build path** — `_rum_begin_parallel`,
+`_rum_parallel_heapscan`, `_rum_parallel_merge`, a shared tuplesort
+(`rumbuild_tuplesort.c`) and the worker entry point
+`documentdb_rum_parallel_build_main`. The GUC
+`documentdb_rum.enable_parallel_index_build` defaults to **on**.
 
-## Approach: port the PG18 parallel GIN build
+The problem is that **DocumentDB's own indexes never reach that path.**
 
-PG18's parallel GIN build is structurally applicable because RUM shares GIN's
-build shape (accumulate → sort → merge → write):
+## Measurement
 
-1. **Parallel heap scan.** Leader sets up `GinBuildShared` (our
-   `RumBuildShared`) in DSM + a shared `tuplesort` (`SharedSortInfo`).
-   Workers attach via `table_parallelscan_*`.
-2. **Per-worker accumulation.** Each worker runs the existing
-   `rumBuildCallback` path into its private `BuildAccumulator` (rbtree),
-   flushing when `maintenance_work_mem / nparticipants` is hit — but instead
-   of inserting into the index, it writes sorted `GinTuple`-style entries
-   (key, category, packed TID list) into the shared tuplesort
-   (`tuplesort_putgintuple` equivalent).
-3. **Leader merge.** After `tuplesort_performsort`, the leader streams
-   entries in (key, category) order, merging TID lists of equal keys
-   (`GinBufferStoreTuple` logic — TID lists arrive sorted, merge is linear)
-   and inserts each merged entry into the tree once. Insertion into a fresh
-   index in fully sorted order is the cheapest possible build path.
-4. **Fallback.** `rumbuild()` keeps the serial path when
-   `parallel_workers == 0`, the table is too small, or the index has
-   attribute types without sortsupport for the packed key comparison.
+On a stock compute image (PG17, `max_parallel_maintenance_workers = 2`,
+`maintenance_work_mem` raised to 1GB, `parallel_index_workers_override = 2`),
+creating an ordinary single-field index through `createIndexes`:
 
-## RUM-specific deltas vs GIN
+```
+DEBUG:  CREATE INDEX documents_rum_index_4 ON documentdb_data.documents_2
+        USING documentdb_rum (document bson_rum_composite_path_ops(pathspec='["s"]', tl=2691))
+DEBUG:  building index "documents_rum_index_4" on table "documents_2" serially
+```
 
-- **Posting payloads.** RUM stores an "addInfo" datum with each posting
-  (this is what documentdb's extended op-classes use for composite/order
-  data). The shared-tuplesort tuple format must carry (key, category, TID,
-  addInfo) — TID list packing becomes (TID, addInfo) pair packing. This is
-  the main divergence from PG18 GIN and the bulk of the port.
-- **Pending list.** RUM has no fastupdate pending list to worry about at
-  build time (build inserts directly) — simpler than GIN here.
-- **WAL.** Neon requires full WAL for every page; parallel build does not
-  change WAL volume, only wall-clock. Generic WAL records (RUM uses generic
-  WAL when not core) — verify volume amplification is unchanged.
+Serial, with parallelism explicitly requested. The reason is in `rumbuild()`:
 
-## Expected gains
+```c
+/* Scenarios that have addinfo need to skip parallel build */
+for (i = 0; i < INDEX_MAX_KEYS && isSortedIndexBuildCapable; i++)
+{
+    if (buildstate.rumstate.addAttrs[i] != NULL)      { isSortedIndexBuildCapable = false; break; }
+    if (buildstate.rumstate.canJoinAddInfo[i])        { isSortedIndexBuildCapable = false; break; }
+}
+if (buildstate.rumstate.attrnAddToColumn != InvalidAttrNumber)
+    isSortedIndexBuildCapable = false;
+```
 
-Build is scan-bound + sort-bound; with N workers the scan and accumulate
-phases parallelize ~linearly. On the measured 8.8M-doc collection with 2
-workers on class l (2 vCPU reserved, burstable): expect ~2x on the scan
-phase; combined with the non-concurrent fast path (already shipped:
-`indexBuildsScheduledOnBgWorker` + `indexBuildNonConcurrentWhenIdle`),
-520s → ~150s territory.
+Every DocumentDB opclass (`bson_rum_composite_path_ops`,
+`bson_rum_single_path_ops`, text ops) carries **addInfo** — that is where the
+term metadata lives. So the exclusion is not an edge case: it covers
+essentially 100% of user index builds, which is why an 8.8M-document
+collection took ~520s single-core in production.
 
-## Plan
+A second, smaller gate: `plan_create_index_workers` requires 32MB of
+`maintenance_work_mem` per worker, so small classes get zero workers anyway.
 
-- [ ] M1: `RumBuildShared` + parallel scan + per-worker accumulate into
-      shared tuplesort, leader merge, **without addInfo** (reject parallel
-      when any column uses addInfo) — validates the skeleton on plain
-      B-tree-ish RUM columns.
-- [ ] M2: (TID, addInfo) pair packing in the shared tuple format — covers
-      documentdb composite op-classes (the real workload).
-- [ ] M3: `documentdb.enableParallelIndexBuild` GUC (default off),
-      `maintenance_work_mem` split, progress reporting
-      (`pg_stat_progress_create_index` phases).
-- [ ] M4: correctness harness — build serial vs parallel on the same data,
-      compare `rumvalidate` + full index scans; perf run on the dev-saldanha
-      dataset copy.
-- [ ] Upstream PR.
+## What actually needs to be built
 
-## References
+Teach the shared tuplesort to carry addInfo, then lift the exclusion.
 
-- PG18 `src/backend/access/gin/gininsert.c` (parallel build machinery,
-  `_gin_parallel_build_main`, `GinBuffer`, `tuplesort_*_gintuple`).
-- `pg_documentdb_extended_rum/src/ruminsert.c` (`rumbuild`,
-  `rumBuildCallback`, `BuildAccumulator`).
-- FeronDB measurements: docs em ferondb-cloud/docs/AUTO-INDEX-ADVISOR.md
-  (pipeline async + fast path idle já em produção).
+- **Tuple format.** The shared sort currently packs `(key, category, TID
+  list)`. It needs `(key, category, [(TID, addInfo)])` — addInfo is a Datum
+  whose type comes from the opclass (`addInfoTypeOid`), so packing must
+  handle by-value and varlena forms, plus a null bitmap (addInfo is
+  optional per posting).
+- **Merge side.** `_rum_parallel_merge` merges TID lists of equal keys; it
+  must merge the paired arrays instead, preserving TID order (the existing
+  invariant) and keeping each addInfo with its TID.
+- **canJoinAddInfo.** Opclasses that can *combine* addInfo across postings
+  (`canJoinAddInfo[i]`) need their join function applied during the merge,
+  not just concatenation. If that turns out to be expensive to do correctly,
+  M1 can keep excluding those specific attributes and cover the rest.
+- **Eligibility.** Replace the blanket exclusion with a per-attribute check:
+  parallel is allowed when every attribute either has no addInfo or has an
+  addInfo type the packer supports.
+- **Memory gate.** Consider lowering the per-worker requirement for RUM (it
+  accumulates differently from btree) or documenting that classes below
+  ~2GB `maintenance_work_mem` stay serial by design.
+
+## Milestones
+
+- [ ] **M1** — addInfo packing in the shared tuple + merge that preserves
+      pairs; eligibility opened for attributes with plain (non-joinable)
+      addInfo. Correctness harness: build the same collection serially and
+      in parallel, compare `pg_relation_size`, full index scans and query
+      results.
+- [ ] **M2** — `canJoinAddInfo` attributes (apply the join during merge).
+- [ ] **M3** — memory/worker heuristics tuned for RUM; progress reporting
+      through `pg_stat_progress_create_index` in the parallel path.
+- [ ] **M4** — benchmark on a production-sized collection (8.8M docs), then
+      upstream PR.
+
+## Expected gain
+
+The build is scan- and sort-bound. With 2 workers on the classes we run
+(2 vCPU reserved, burstable), the earlier 520s serial build should land
+near 250-300s; combined with the non-concurrent fast path already shipped
+(`indexBuildNonConcurrentWhenIdle`), well under 200s.
+
+## Why this is worth doing upstream
+
+The parallel machinery is already written and tested — the only thing
+standing between it and every DocumentDB user is addInfo support in one
+tuple format. That is a contained, high-leverage change.
