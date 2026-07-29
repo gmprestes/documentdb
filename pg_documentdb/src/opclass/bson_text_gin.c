@@ -20,6 +20,7 @@
 #include <tsearch/ts_type.h>
 #include <tsearch/ts_cache.h>
 #include <catalog/namespace.h>
+#include <parser/parse_func.h>
 #include <utils/array.h>
 #include <nodes/makefuncs.h>
 
@@ -270,7 +271,65 @@ rum_bson_text_path_options(PG_FUNCTION_ARGS)
 							   "The name of the path within the document that has the language override",
 							   NULL, NULL, NULL,
 							   offsetof(BsonGinTextPathOptions, languageOverride));
+	add_local_int_reloption(relopts, "textversion",
+							"The mongo textIndexVersion (3 = diacritic insensitive via unaccent)",
+							2, /* default value */
+							2, /* min */
+							3, /* max */
+							offsetof(BsonGinTextPathOptions, textIndexVersion));
 	PG_RETURN_VOID();
+}
+
+
+/*
+ * Resolves (and caches) the unaccent(text) function from the unaccent
+ * extension, honoring the search path with a fallback to the public schema.
+ * Version-3 text indexes require it for diacritic folding.
+ */
+static Oid
+GetUnaccentFunctionOid(void)
+{
+	static Oid unaccentOid = InvalidOid;
+	if (OidIsValid(unaccentOid))
+	{
+		return unaccentOid;
+	}
+
+	Oid argTypes[1] = { TEXTOID };
+	bool missingOk = true;
+	unaccentOid = LookupFuncName(list_make1(makeString("unaccent")), 1,
+								 argTypes, missingOk);
+	if (!OidIsValid(unaccentOid))
+	{
+		unaccentOid = LookupFuncName(list_make2(makeString("public"),
+												makeString("unaccent")), 1,
+									 argTypes, missingOk);
+	}
+	if (!OidIsValid(unaccentOid))
+	{
+		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_FUNCTION),
+						errmsg(
+							"textIndexVersion 3 requires the unaccent extension"),
+						errhint(
+							"Run CREATE EXTENSION unaccent, or disable "
+							"enableTextIndexVersion3.")));
+	}
+	return unaccentOid;
+}
+
+
+/*
+ * Applies version-3 diacritic folding to a UTF-8 string via unaccent().
+ * Returns a palloc'd text datum's payload; sets *foldedLength.
+ */
+static const char *
+ApplyDiacriticFolding(const char *str, uint32_t length, uint32_t *foldedLength)
+{
+	Datum input = PointerGetDatum(cstring_to_text_with_len(str, length));
+	Datum folded = OidFunctionCall1(GetUnaccentFunctionOid(), input);
+	text *foldedText = DatumGetTextPP(folded);
+	*foldedLength = VARSIZE_ANY_EXHDR(foldedText);
+	return VARDATA_ANY(foldedText);
 }
 
 
@@ -528,8 +587,22 @@ BsonTextGenerateTSQueryCore(const bson_value_t *queryValue, bytea *indexOptions,
 	}
 
 	/* we have a valid ts_query string. */
+	/* Version 3: fold diacritics in the search string so it matches the
+	 * folded index terms (see GenerateTsVectorWithOptions). */
+	const char *searchStr = searchValue.value.v_utf8.str;
+	uint32_t searchLen = searchValue.value.v_utf8.len;
+	if (indexOptions != NULL)
+	{
+		BsonGinTextPathOptions *textOptions =
+			(BsonGinTextPathOptions *) indexOptions;
+		if (textOptions->textIndexVersion >= 3)
+		{
+			searchStr = ApplyDiacriticFolding(searchStr, searchLen, &searchLen);
+		}
+	}
+
 	/* first pass: we use the websearch_to_tsquery as it has the closest rules to native mongo; */
-	Datum textDatum = CStringGetTextDatum(searchValue.value.v_utf8.str);
+	Datum textDatum = PointerGetDatum(cstring_to_text_with_len(searchStr, searchLen));
 
 	Datum result;
 	if (tsConfigOid != InvalidOid)
@@ -1369,19 +1442,28 @@ GenerateTsVectorWithOptions(pgbson *document,
 				languageOid = collationConfigurationOid;
 			}
 
+			/* Version 3: fold diacritics so index terms match v3's
+			 * diacritic-insensitive semantics (query side folds too). */
+			const char *textStr = term.element.bsonValue.value.v_utf8.str;
+			uint32_t textLen = term.element.bsonValue.value.v_utf8.len;
+			if (options->textIndexVersion >= 3)
+			{
+				textStr = ApplyDiacriticFolding(textStr, textLen, &textLen);
+			}
+
 			/* Generate text words */
 			ParsedText text = { 0 };
 
 			/* Random estimate of word count (see to_tsvector) */
-			text.lenwords = Max(term.element.bsonValue.value.v_utf8.len / 6, 2);
+			text.lenwords = Max(textLen / 6, 2);
 			text.curwords = 0;
 			text.pos = 0;
 			text.words = (ParsedWord *) palloc(sizeof(ParsedWord) * text.lenwords);
 			parsetext(
 				languageOid,
 				&text,
-				term.element.bsonValue.value.v_utf8.str,
-				term.element.bsonValue.value.v_utf8.len);
+				textStr,
+				textLen);
 
 			/* make the tsvector from it */
 			TSVector vector = make_tsvector(&text);

@@ -160,6 +160,10 @@ typedef struct
 	/* The default language for text indexes */
 	char *defaultLanguage;
 
+	/* Mongo textIndexVersion for text indexes (2 or 3; 0 = unspecified).
+	 * 3 requires EnableTextIndexVersion3 (diacritic folding via unaccent). */
+	int textIndexVersion;
+
 	/* The term in the document for specifying language overrides */
 	char *languageOverride;
 

@@ -65,6 +65,8 @@
 #include "vector/vector_utilities.h"
 #include "index_am/index_am_utils.h"
 
+extern bool EnableTextIndexVersion3;
+
 /* Return value of TryCreateCollectionIndexes */
 typedef struct
 {
@@ -300,6 +302,7 @@ static char * GenerateIndexExprStr(const char *indexAmSuffix,
 								   indexDefWildcardProjTree,
 								   const char *indexName, const char *defaultLanguage,
 								   const char *languageOverride,
+								   int textIndexVersion,
 								   bool enableLargeIndexKeys,
 								   bool useReducedWildcardTerms,
 								   const char *indexAmOpClassCatalogSchema,
@@ -1734,15 +1737,26 @@ ParseIndexDefDocumentInternal(const bson_iter_t *indexesArrayIter,
 			int version = BsonValueAsInt32(value);
 			if (version == 3)
 			{
-				/* MongoDB's default since 3.2 — which means every dump of a
-				 * modern deployment carries version 3 and a hard error here
-				 * fails whole mongorestore index phases. We implement
-				 * version-2 semantics (case insensitive, diacritic
-				 * sensitive); v3 only adds diacritic insensitivity. Accept
-				 * the spec, build v2, and say so. */
-				ereport(NOTICE, (errmsg(
-									 "textIndexVersion 3 requested; building with "
-									 "version 2 semantics (diacritic sensitive)")));
+				if (EnableTextIndexVersion3)
+				{
+					/* Full v3: diacritic-insensitive terms and queries via
+					 * the unaccent extension (gated by the GUC because the
+					 * extension may not be installed everywhere). */
+					indexDef->textIndexVersion = 3;
+				}
+				else
+				{
+					/* MongoDB's default since 3.2 — which means every dump
+					 * of a modern deployment carries version 3 and a hard
+					 * error here fails whole mongorestore index phases. We
+					 * implement version-2 semantics (case insensitive,
+					 * diacritic sensitive); v3 only adds diacritic
+					 * insensitivity. Accept the spec, build v2, say so. */
+					ereport(NOTICE, (errmsg(
+										 "textIndexVersion 3 requested; building with "
+										 "version 2 semantics (diacritic sensitive)")));
+					indexDef->textIndexVersion = 2;
+				}
 			}
 			else if (version != 2)
 			{
@@ -1753,6 +1767,10 @@ ParseIndexDefDocumentInternal(const bson_iter_t *indexesArrayIter,
 								errdetail_log(
 									"Currently only textIndexVersion 2 is supported, not %d",
 									version)));
+			}
+			else if (version == 2)
+			{
+				indexDef->textIndexVersion = 2;
 			}
 		}
 		else if (strcmp(indexDefDocKey, "background") == 0)
@@ -4919,6 +4937,7 @@ CreatePostgresIndexCreationCmd(uint64 collectionId, IndexDef *indexDef, int inde
 											  indexDef->name,
 											  indexDef->defaultLanguage,
 											  indexDef->languageOverride,
+											  indexDef->textIndexVersion,
 											  enableLargeIndexKeys,
 											  useReducedWildcardTermGeneration,
 											  indexAm->get_opclass_catalog_schema(),
@@ -5068,6 +5087,7 @@ CreatePostgresIndexCreationCmd(uint64 collectionId, IndexDef *indexDef, int inde
 											  indexDef->name,
 											  indexDef->defaultLanguage,
 											  indexDef->languageOverride,
+											  indexDef->textIndexVersion,
 											  enableLargeIndexKeys,
 											  useReducedWildcardTermGeneration,
 											  indexAm->get_opclass_catalog_schema(),
@@ -5440,7 +5460,8 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 					 IndexDefKey *indexDefKey,
 					 const BsonIntermediatePathNode *indexDefWildcardProjTree,
 					 const char *indexName, const char *defaultLanguage,
-					 const char *languageOverride, bool enableLargeIndexKeys,
+					 const char *languageOverride, int textIndexVersion,
+					 bool enableLargeIndexKeys,
 					 bool useReducedWildcardTerms,
 					 const char *indexAmOpClassCatalogSchema,
 					 const char *indexAmOpClassInternalCatalogSchema)
@@ -5451,6 +5472,9 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 	char *languageOptionValue = "";
 	char *languageOverrideKey = "";
 	char *languageOverrideValue = "";
+
+	/* textversion=3 turns on diacritic folding in the text opclass */
+	const char *textVersionOption = textIndexVersion >= 3 ? ",textversion=3" : "";
 	if (defaultLanguage != NULL)
 	{
 		languageOptionKey = ",defaultlanguage=";
@@ -5524,7 +5548,7 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 		if (indexDefKey->hasTextIndexes)
 		{
 			appendStringInfo(indexExprStr,
-							 "%s document %s.bson_%s_text_path_ops(weights=%s%s%s%s%s%s)",
+							 "%s document %s.bson_%s_text_path_ops(weights=%s%s%s%s%s%s%s)",
 							 firstColumnWritten ? "," : "",
 							 indexAmOpClassCatalogSchema,
 							 indexAmSuffix,
@@ -5533,7 +5557,8 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 							 list_length(indexDefKey->textPathList) == 0 ?
 							 ", iswildcard=true" : "",
 							 languageOptionKey, languageOptionValue,
-							 languageOverrideKey, languageOverrideValue);
+							 languageOverrideKey, languageOverrideValue,
+						 textVersionOption);
 			firstColumnWritten = true;
 		}
 		else if (!indexDefWildcardProjTree)
@@ -5913,7 +5938,7 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 					}
 
 					appendStringInfo(indexExprStr,
-									 "%s document %s.bson_%s_text_path_ops(weights=%s%s%s%s%s%s)",
+									 "%s document %s.bson_%s_text_path_ops(weights=%s%s%s%s%s%s%s)",
 									 firstColumnWritten ? "," : "",
 									 indexAmOpClassCatalogSchema,
 									 indexAmSuffix,
@@ -5921,7 +5946,8 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 															indexDefKey->textPathList)),
 									 indexKeyPath->isWildcard ? ", iswildcard=true" : "",
 									 languageOptionKey, languageOptionValue,
-									 languageOverrideKey, languageOverrideValue);
+									 languageOverrideKey, languageOverrideValue,
+						 textVersionOption);
 					textOptionsIndexWritten = true;
 					break;
 				}
@@ -5963,7 +5989,7 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 		if (indexDefKey->hasTextIndexes && !textOptionsIndexWritten)
 		{
 			appendStringInfo(indexExprStr,
-							 "%s document %s.bson_%s_text_path_ops(weights=%s%s%s%s%s%s)",
+							 "%s document %s.bson_%s_text_path_ops(weights=%s%s%s%s%s%s%s)",
 							 firstColumnWritten ? "," : "",
 							 indexAmOpClassCatalogSchema,
 							 indexAmSuffix,
@@ -5971,7 +5997,8 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 													indexDefKey->textPathList)),
 							 indexDefKey->isWildcard ? ", iswildcard=true" : "",
 							 languageOptionKey, languageOptionValue,
-							 languageOverrideKey, languageOverrideValue);
+							 languageOverrideKey, languageOverrideValue,
+						 textVersionOption);
 		}
 	}
 
