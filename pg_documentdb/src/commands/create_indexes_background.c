@@ -1133,6 +1133,29 @@ setup_index_queue_table(PG_FUNCTION_ARGS)
  * SubmitCreateIndexesRequest is the function that submits the create index request to local table
  * and submits indexes into metadata as invalid.
  */
+/*
+ * NoOtherActiveClientBackends returns true when no client backend other than
+ * the calling one is actively running a query in this database. Pooled but
+ * idle connections (state = 'idle') do not count. Used to opt index builds
+ * into the faster non-concurrent path when nobody would be disturbed by its
+ * ShareLock.
+ */
+static bool
+NoOtherActiveClientBackends(void)
+{
+	bool isNull = true;
+	bool readOnly = true;
+	Datum count = ExtensionExecuteQueryViaSPI(
+		"SELECT count(*) FROM pg_stat_activity"
+		" WHERE datname = current_database()"
+		" AND pid != pg_backend_pid()"
+		" AND backend_type = 'client backend'"
+		" AND state != 'idle'",
+		readOnly, SPI_OK_SELECT, &isNull);
+	return !isNull && DatumGetInt64(count) == 0;
+}
+
+
 static CreateIndexesResult
 SubmitCreateIndexesRequest(Datum dbNameDatum,
 						   pgbson *createIndexesMessage, bool *volatile snapshotSet)
@@ -1245,6 +1268,22 @@ SubmitCreateIndexesRequest(Datum dbNameDatum,
 		return innerResult;
 	}
 
+	/*
+	 * When enabled and the database has no other active client backend at
+	 * submit time (the common case right after a bulk load / restore), queue
+	 * plain CREATE INDEX commands: one table scan instead of CONCURRENTLY's
+	 * two, roughly halving the build. Decided once per request — the check
+	 * runs a catalog query.
+	 */
+	bool idleNonConcurrentBuild = IndexBuildNonConcurrentWhenIdle &&
+								  NoOtherActiveClientBackends();
+	if (idleNonConcurrentBuild)
+	{
+		elog_unredacted(
+			"queueing non-concurrent index builds for collection " UINT64_FORMAT
+			" (no other active client backend at submit)", collectionId);
+	}
+
 	foreach(indexDefCell, createIndexesArg.indexDefList)
 	{
 		IndexDef *indexDef = (IndexDef *) lfirst(indexDefCell);
@@ -1256,7 +1295,7 @@ SubmitCreateIndexesRequest(Datum dbNameDatum,
 		bool createIndexesConcurrently = true;
 		bool isTempCollection = false;
 
-		if (createIndexesArg.blocking || indexDef->blocking)
+		if (createIndexesArg.blocking || indexDef->blocking || idleNonConcurrentBuild)
 		{
 			createIndexesConcurrently = false;
 		}

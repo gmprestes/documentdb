@@ -294,6 +294,9 @@ bool EnableCollModUnique = DEFAULT_ENABLE_COLLMOD_UNIQUE;
 #define DEFAULT_INDEX_BUILDS_SCHEDULED_ON_BGWORKER false
 bool IndexBuildsScheduledOnBgWorker = DEFAULT_INDEX_BUILDS_SCHEDULED_ON_BGWORKER;
 
+#define DEFAULT_INDEX_BUILD_NON_CONCURRENT_WHEN_IDLE false
+bool IndexBuildNonConcurrentWhenIdle = DEFAULT_INDEX_BUILD_NON_CONCURRENT_WHEN_IDLE;
+
 /* FEATURE FLAGS END */
 
 void
@@ -832,5 +835,19 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 			"Whether to schedule index builds via background worker jobs."),
 		NULL, &IndexBuildsScheduledOnBgWorker,
 		DEFAULT_INDEX_BUILDS_SCHEDULED_ON_BGWORKER,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.indexBuildNonConcurrentWhenIdle", newGucPrefix),
+		gettext_noop(
+			"Queue index builds as plain (non-concurrent) CREATE INDEX when no "
+			"other client backend is active in the database at submit time. A "
+			"plain build takes one table scan instead of CONCURRENTLY's two, "
+			"roughly halving build time; its ShareLock only matters if writers "
+			"show up mid-build (they block until it finishes). Intended for "
+			"single-tenant deployments where createIndexes typically runs right "
+			"after a bulk load, with no concurrent traffic."),
+		NULL, &IndexBuildNonConcurrentWhenIdle,
+		DEFAULT_INDEX_BUILD_NON_CONCURRENT_WHEN_IDLE,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 }
