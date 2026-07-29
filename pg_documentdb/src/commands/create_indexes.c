@@ -1732,7 +1732,19 @@ ParseIndexDefDocumentInternal(const bson_iter_t *indexesArrayIter,
 			}
 
 			int version = BsonValueAsInt32(value);
-			if (version != 2)
+			if (version == 3)
+			{
+				/* MongoDB's default since 3.2 — which means every dump of a
+				 * modern deployment carries version 3 and a hard error here
+				 * fails whole mongorestore index phases. We implement
+				 * version-2 semantics (case insensitive, diacritic
+				 * sensitive); v3 only adds diacritic insensitivity. Accept
+				 * the spec, build v2, and say so. */
+				ereport(NOTICE, (errmsg(
+									 "textIndexVersion 3 requested; building with "
+									 "version 2 semantics (diacritic sensitive)")));
+			}
+			else if (version != 2)
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
 								errmsg(
