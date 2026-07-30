@@ -215,6 +215,9 @@ static Query * HandleGeoNear(const bson_value_t *existingValue, Query *query,
 static Query * HandleMatchAggregationStage(const bson_value_t *existingValue,
 										   Query *query,
 										   AggregationPipelineBuildContext *context);
+static void TryAddFullScanQualForKeyPath(Expr *documentExpr, const char *path,
+										 uint32_t pathLength, Query *query,
+										 AggregationPipelineBuildContext *context);
 
 static bool RequiresPersistentCursorFalse(const bson_value_t *pipelineValue,
 										  bool *isSingleRowResult);
@@ -4484,6 +4487,18 @@ HandleDistinct(const StringView *distinctKey, Query *query,
 		query = MigrateQueryToSubQuery(query, context);
 	}
 
+	/*
+	 * Let the planner consider an ordered index scan on the distinct key
+	 * (same pushdown HandleGroup does for the group key). The planner either
+	 * turns this into an index condition or trims it away.
+	 */
+	if (!IsCollationApplicable(context->collationString))
+	{
+		TargetEntry *documentEntry = linitial(query->targetList);
+		TryAddFullScanQualForKeyPath(documentEntry->expr, distinctKey->string,
+									 distinctKey->length, query, context);
+	}
+
 	/* The first projector is the document */
 	TargetEntry *firstEntry = linitial(query->targetList);
 	Expr *currentProjection = firstEntry->expr;
@@ -4503,6 +4518,7 @@ HandleDistinct(const StringView *distinctKey, Query *query,
 	SortGroupClause *distinctSortGroup = makeNode(SortGroupClause);
 	distinctSortGroup->eqop = BsonEqualOperatorId();
 	distinctSortGroup->sortop = BsonLessThanOperatorId();
+	distinctSortGroup->hashable = true;
 	distinctSortGroup->tleSortGroupRef = assignSortGroupRef(firstEntry,
 															query->targetList);
 	query->distinctClause = list_make1(distinctSortGroup);
@@ -4829,6 +4845,40 @@ CanPushSortFilterToIndex(Query *query, AggregationPipelineBuildContext *context)
 	 * get the sort.
 	 */
 	return entry->rtekind == RTE_RELATION && context->mongoCollection != NULL;
+}
+
+
+/*
+ * Adds a bson_full_scan() qualifier for the given key path so the planner can
+ * consider an ordered index scan (see ProcessFullScanForOrderBy). The qual is
+ * either converted into an index condition or trimmed away by the planner, so
+ * adding it never changes query results.
+ */
+static void
+TryAddFullScanQualForKeyPath(Expr *documentExpr, const char *path,
+							 uint32_t pathLength, Query *query,
+							 AggregationPipelineBuildContext *context)
+{
+	if (!EnableIndexOrderbyPushdown ||
+		!CanPushSortFilterToIndex(query, context))
+	{
+		return;
+	}
+
+	pgbsonelement sortElement = { 0 };
+	sortElement.path = path;
+	sortElement.pathLength = pathLength;
+	sortElement.bsonValue.value_type = BSON_TYPE_INT32;
+	sortElement.bsonValue.value.v_int32 = 1;
+	pgbson *sortSpec = PgbsonElementToPgbson(&sortElement);
+	Const *sortConst = MakeBsonConst(sortSpec);
+	List *rangeArgs = list_make2(documentExpr, sortConst);
+	Expr *fullScanExpr = (Expr *) makeFuncExpr(
+		BsonFullScanFunctionOid(), BOOLOID, rangeArgs,
+		InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+	List *currentQuals = make_ands_implicit((Expr *) query->jointree->quals);
+	currentQuals = lappend(currentQuals, fullScanExpr);
+	query->jointree->quals = (Node *) make_ands_explicit(currentQuals);
 }
 
 
@@ -6519,25 +6569,12 @@ HandleGroup(const bson_value_t *existingValue, Query *query,
 		 * If there's an orderby pushdown to the index, add a full scan clause iff
 		 * the query has no filters yet.
 		 */
-		if (isGroupByValidForIndexPushdown &&
-			CanPushSortFilterToIndex(query, context))
+		if (isGroupByValidForIndexPushdown)
 		{
-			pgbsonelement sortElement = { 0 };
-			sortElement.path = idValue.value.v_utf8.str + 1;
-			sortElement.pathLength = idValue.value.v_utf8.len - 1;
-			sortElement.bsonValue.value_type = BSON_TYPE_INT32;
-			sortElement.bsonValue.value.v_int32 = 1;
-			pgbson *sortSpec = PgbsonElementToPgbson(&sortElement);
-			Const *sortConst = MakeBsonConst(sortSpec);
-			List *rangeArgs = list_make2(origEntry->expr, sortConst);
-			Expr *fullScanExpr = (Expr *) makeFuncExpr(
-				BsonFullScanFunctionOid(), BOOLOID, rangeArgs,
-				InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
-			List *currentQuals = make_ands_implicit(
-				(Expr *) query->jointree->quals);
-			currentQuals = lappend(currentQuals, fullScanExpr);
-			query->jointree->quals = (Node *) make_ands_explicit(
-				currentQuals);
+			TryAddFullScanQualForKeyPath(origEntry->expr,
+										 idValue.value.v_utf8.str + 1,
+										 idValue.value.v_utf8.len - 1,
+										 query, context);
 		}
 	}
 
