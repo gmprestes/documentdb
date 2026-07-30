@@ -13,6 +13,7 @@
 
 #include <postgres.h>
 #include <utils/rel.h>
+#include <utils/snapshot.h>
 
 struct IndexScanDescData;
 struct ExplainState;
@@ -22,6 +23,22 @@ typedef void (*TryExplainIndexFunc)(struct IndexScanDescData *scan, struct
 
 typedef bool (*GetMultikeyStatusFunc)(Relation indexRelation);
 typedef bool (*GetTruncationStatusFunc)(Relation indexRelation);
+
+/*
+ * ABI contract with the extended RUM library's entry enumeration (see
+ * rum_enumerate.h there): called once per visible distinct entry key, in
+ * index key order; entryKey points into a transient buffer and must be
+ * copied if kept; returning false stops the enumeration.
+ */
+typedef bool (*RumEnumerateEntryCallbackFunc)(Datum entryKey, int category,
+											  void *context);
+typedef void (*RumEnumerateVisibleEntriesFunc)(Relation indexRelation,
+											   Relation heapRelation,
+											   Snapshot snapshot,
+											   OffsetNumber attnum,
+											   RumEnumerateEntryCallbackFunc
+											   callback,
+											   void *callbackContext);
 
 /*
  * Data structure for an alternative index acess method for indexing bosn.

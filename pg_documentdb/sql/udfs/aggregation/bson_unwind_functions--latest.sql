@@ -22,3 +22,9 @@ CREATE OR REPLACE FUNCTION __API_CATALOG_SCHEMA__.bson_build_distinct_response(_
  LANGUAGE c
  IMMUTABLE PARALLEL SAFE
 AS 'MODULE_PATHNAME', $function$bson_build_distinct_response$function$;
+
+CREATE OR REPLACE FUNCTION __API_SCHEMA_INTERNAL_V2__.bson_distinct_index_scan(text, text, text)
+ RETURNS __CORE_SCHEMA__.bson
+ LANGUAGE c
+ STABLE PARALLEL RESTRICTED STRICT
+AS 'MODULE_PATHNAME', $function$bson_distinct_index_scan$function$;

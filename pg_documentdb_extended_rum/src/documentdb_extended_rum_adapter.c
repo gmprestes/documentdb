@@ -15,6 +15,7 @@
 #include "postgres.h"
 #include <miscadmin.h>
 #include "pg_documentdb_rum.h"
+#include "rum_enumerate.h"
 #include <catalog/pg_am.h>
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"

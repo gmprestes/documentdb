@@ -2343,6 +2343,24 @@ GenerateDistinctQuery(text *databaseDatum, pgbson *distinctSpec, bool setStateme
 	Query *query = GenerateBaseTableQuery(databaseDatum, &collectionName, collectionUuid,
 										  &indexHint, &context);
 
+	/* Fast path: a filter-less distinct over a covering composite index can
+	 * enumerate the index's entry tree (O(distinct values)) instead of
+	 * unwinding every document; execution falls back to this query's exact
+	 * plan whenever the index turns out ineligible.
+	 */
+	if (filter.value_type == BSON_TYPE_EOD &&
+		indexHint.value_type == BSON_TYPE_EOD &&
+		!IsCollationApplicable(context.collationString))
+	{
+		Query *indexDistinctQuery = TryGenerateIndexDistinctQuery(
+			databaseDatum, &distinctKey, &collectionName,
+			context.mongoCollection);
+		if (indexDistinctQuery != NULL)
+		{
+			return indexDistinctQuery;
+		}
+	}
+
 	/* First apply match */
 	if (filter.value_type != BSON_TYPE_EOD)
 	{

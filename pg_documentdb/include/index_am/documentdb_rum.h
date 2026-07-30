@@ -100,6 +100,8 @@ bool extension_ruminsert_core(Relation indexRelation,
 
 bool RumGetTruncationStatus(Relation indexRelation);
 
+RumEnumerateVisibleEntriesFunc GetRumEnumerateVisibleEntriesFunc(void);
+
 struct ExplainState;
 void ExplainCompositeScan(IndexScanDesc scan, struct ExplainState *es);
 void ExplainRawCompositeScan(Relation index_rel, List *indexQuals, List *indexOrderBy,

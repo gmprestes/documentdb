@@ -230,6 +230,7 @@ typedef struct SortIndexInputDetails
 } SortIndexInputDetails;
 
 
+struct IndexPath;
 struct IndexOptInfo;
 bool CompositeIndexSupportsIndexOnlyScan(const struct IndexOptInfo *indexinfo);
 
