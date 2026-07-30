@@ -77,6 +77,7 @@ static BsonIndexAmEntry DocumentDBIndexAmEntry = {
 	.get_opclass_internal_catalog_schema = GetDocumentDBCatalogSchema,
 	.get_multikey_status = documentdb_rum_get_multi_key_status,
 	.get_truncation_status = RumGetTruncationStatus,
+	.enumerate_visible_entries = documentdb_rum_enumerate_visible_entries,
 };
 static DocumentDBRumOidCacheData Cache = { 0 };
 static bool has_custom_routine = false;

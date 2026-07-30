@@ -61,7 +61,6 @@ const RumIndexArrayStateFuncs *IndexArrayStateFuncs = &RoaringStateFuncs;
 
 static GetMultikeyStatusFunc rum_index_multi_key_get_func = NULL;
 static UpdateMultikeyStatusFunc rum_index_multi_key_update_func = NULL;
-static RumEnumerateVisibleEntriesFunc rum_enumerate_visible_entries_func = NULL;
 
 typedef enum IndexMultiKeyStatus
 {
@@ -175,7 +174,6 @@ typedef enum RumFunctionCatalog
 	RumFunction_RumGetMultiKeyStatus,
 	RumFunction_RumUpdateMultiKeyStatus,
 	RumFunction_SetUnredactedLogHook,
-	RumFunction_RumEnumerateVisibleEntries,
 	RumFunction_Max,
 } RumFunctionCatalog;
 
@@ -194,8 +192,7 @@ static const char *RumFunctionArray[RumFunction_Max] =
 	[RumFunction_CanRumIndexScanOrdered] = "can_rum_index_scan_ordered",
 	[RumFunction_RumGetMultiKeyStatus] = "rum_get_multi_key_status",
 	[RumFunction_RumUpdateMultiKeyStatus] = "rum_update_multi_key_status",
-	[RumFunction_SetUnredactedLogHook] = "SetRumUnredactedLogEmitHook",
-	[RumFunction_RumEnumerateVisibleEntries] = "rum_enumerate_visible_entries"
+	[RumFunction_SetUnredactedLogHook] = "SetRumUnredactedLogEmitHook"
 };
 
 
@@ -215,8 +212,6 @@ static const char *DocumentDBRumFunctionArray[RumFunction_Max] =
 	[RumFunction_RumGetMultiKeyStatus] = "documentdb_rum_get_multi_key_status",
 	[RumFunction_RumUpdateMultiKeyStatus] = "documentdb_rum_update_multi_key_status",
 	[RumFunction_SetUnredactedLogHook] = "DocumentDBSetRumUnredactedLogEmitHook",
-	[RumFunction_RumEnumerateVisibleEntries] =
-		"documentdb_rum_enumerate_visible_entries",
 };
 
 
@@ -562,16 +557,6 @@ LoadRumRoutine(void)
 							   !missingOk,
 							   ignoreLibFileHandle);
 
-	/* Optional: only the extended RUM library provides entry enumeration.
-	 * (missingOk was flipped to true above, so !missingOk means optional.)
-	 */
-	rum_enumerate_visible_entries_func = (RumEnumerateVisibleEntriesFunc)
-		load_external_function(rumLibPath,
-							   functionCatalog[
-								   RumFunction_RumEnumerateVisibleEntries],
-							   !missingOk,
-							   ignoreLibFileHandle);
-
 	ereport(LOG, (errmsg("rum library has update func %d, get func %d",
 						 rum_index_multi_key_update_func != NULL,
 						 rum_index_multi_key_get_func != NULL)));
@@ -579,17 +564,6 @@ LoadRumRoutine(void)
 	pfree(indexRoutine);
 }
 
-
-/*
- * Returns the loaded RUM entry enumeration function, or NULL when the active
- * RUM library does not provide one (e.g. stock RUM).
- */
-RumEnumerateVisibleEntriesFunc
-GetRumEnumerateVisibleEntriesFunc(void)
-{
-	EnsureRumLibLoaded();
-	return rum_enumerate_visible_entries_func;
-}
 
 
 /*

@@ -2348,7 +2348,8 @@ GenerateDistinctQuery(text *databaseDatum, pgbson *distinctSpec, bool setStateme
 	 * unwinding every document; execution falls back to this query's exact
 	 * plan whenever the index turns out ineligible.
 	 */
-	if (filter.value_type == BSON_TYPE_EOD &&
+	if ((filter.value_type == BSON_TYPE_EOD ||
+		 IsBsonValueEmptyDocument(&filter)) &&
 		indexHint.value_type == BSON_TYPE_EOD &&
 		!IsCollationApplicable(context.collationString))
 	{

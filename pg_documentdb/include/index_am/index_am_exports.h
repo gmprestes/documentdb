@@ -80,6 +80,10 @@ typedef struct
 
 	/* Optional function to that returns the truncation status of an index */
 	GetTruncationStatusFunc get_truncation_status;
+
+	/* Optional function that enumerates the visible distinct entry keys of
+	 * an index in key order (see RumEnumerateEntryCallbackFunc). */
+	RumEnumerateVisibleEntriesFunc enumerate_visible_entries;
 } BsonIndexAmEntry;
 
 /*

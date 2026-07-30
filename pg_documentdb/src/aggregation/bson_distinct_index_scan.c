@@ -181,7 +181,8 @@ OpenEligibleDistinctIndex(MongoCollection *collection, const char *distinctKey,
 											 indexRel->rd_opfamily[0],
 											 &getMultiKeyStatusFunc,
 											 &getTruncationStatusFunc) ||
-			getMultiKeyStatusFunc == NULL || getTruncationStatusFunc == NULL)
+			getMultiKeyStatusFunc == NULL || getTruncationStatusFunc == NULL ||
+			GetEnumerateVisibleEntriesFuncByRelAm(indexRel->rd_rel->relam) == NULL)
 		{
 			index_close(indexRel, AccessShareLock);
 			continue;
@@ -300,22 +301,13 @@ bson_distinct_index_scan(PG_FUNCTION_ARGS)
 	text *collectionText = PG_GETARG_TEXT_P(1);
 	text *keyText = PG_GETARG_TEXT_P(2);
 
-	RumEnumerateVisibleEntriesFunc enumerateFunc =
-		GetRumEnumerateVisibleEntriesFunc();
-
-	MongoCollection *collection = NULL;
-	if (enumerateFunc != NULL)
-	{
-		collection = GetMongoCollectionByNameDatum(
-			PointerGetDatum(databaseText), PointerGetDatum(collectionText),
-			AccessShareLock);
-	}
+	MongoCollection *collection = GetMongoCollectionByNameDatum(
+		PointerGetDatum(databaseText), PointerGetDatum(collectionText),
+		AccessShareLock);
 
 	if (collection == NULL)
 	{
-		/* Library without enumeration support, or a collection that vanished
-		 * (or is a view): the fallback handles every one of these.
-		 */
+		/* A collection that vanished (or is a view): the fallback handles it. */
 		return RunDistinctHeapFallback(databaseText, collectionText, keyText);
 	}
 
@@ -327,6 +319,9 @@ bson_distinct_index_scan(PG_FUNCTION_ARGS)
 	{
 		return RunDistinctHeapFallback(databaseText, collectionText, keyText);
 	}
+
+	RumEnumerateVisibleEntriesFunc enumerateFunc =
+		GetEnumerateVisibleEntriesFuncByRelAm(indexRel->rd_rel->relam);
 
 	Relation heapRel = table_open(collection->relationId, AccessShareLock);
 
@@ -375,11 +370,6 @@ TryGenerateIndexDistinctQuery(text *databaseDatum, const StringView *distinctKey
 {
 	if (!EnableIndexDistinctScan || collection == NULL ||
 		collection->viewDefinition != NULL)
-	{
-		return NULL;
-	}
-
-	if (GetRumEnumerateVisibleEntriesFunc() == NULL)
 	{
 		return NULL;
 	}

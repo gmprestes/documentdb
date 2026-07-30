@@ -60,6 +60,7 @@ bool IsHashedPathOpFamilyOid(Oid relam, Oid opFamilyOid);
 bool IsOrderBySupportedOnOpClass(Oid indexAm, Oid IndexPathOpFamilyAm);
 
 GetMultikeyStatusFunc GetMultiKeyStatusByRelAm(Oid relam);
+RumEnumerateVisibleEntriesFunc GetEnumerateVisibleEntriesFuncByRelAm(Oid relam);
 bool GetIndexSupportsBackwardsScan(Oid relam, bool *indexCanOrder);
 
 bool GetIndexAmSupportsIndexOnlyScan(Oid indexAm, Oid opFamilyOid,
