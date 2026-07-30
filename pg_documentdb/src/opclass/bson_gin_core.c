@@ -1522,6 +1522,23 @@ GenerateTermPath(bson_iter_t *bsonIter, const char *basePath,
 				if (IsBsonValueEmptyArray(&element.bsonValue))
 				{
 					element.bsonValue.value_type = BSON_TYPE_UNDEFINED;
+
+					/* An empty array still makes the index multikey (as in
+					 * MongoDB): its undefined-value term collides with the
+					 * path-missing term in the entry tree (value-only terms
+					 * compare by value alone), so covered projections cannot
+					 * tell "[]" apart from "missing". Marking multikey keeps
+					 * such collections out of index-only scans. Wildcard
+					 * paths are skipped: they never serve index-only scans
+					 * and the flag would add a spurious multikey root term.
+					 */
+					GinEntryPathData *arrayPathData =
+						context->getPathDataFunc(context->pathDataState,
+												 pathIndex);
+					if (!arrayPathData->skipGenerateTopLevelDocumentTerm)
+					{
+						arrayPathData->hasArrayValues = true;
+					}
 				}
 				else
 				{

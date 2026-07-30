@@ -202,6 +202,12 @@ typedef struct
 Query * MutateQueryWithPipeline(Query *query, List *aggregationStages,
 								AggregationPipelineBuildContext *context);
 Query * MigrateQueryToSubQuery(Query *parse, AggregationPipelineBuildContext *context);
+
+/* bson_distinct_index_scan.c */
+Query * TryGenerateIndexDistinctQuery(text *databaseDatum,
+									  const StringView *distinctKey,
+									  const StringView *collectionName,
+									  MongoCollection *collection);
 Aggref * CreateMultiArgAggregate(Oid aggregateFunctionId, List *args, List *argTypes,
 								 ParseState *parseState);
 List * ExtractAggregationStages(const bson_value_t *pipelineValue,

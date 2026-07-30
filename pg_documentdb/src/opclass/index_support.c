@@ -201,7 +201,7 @@ static OpExpr * CreateExistsTrueOpExpr(Expr *documentExpr, const char *sourcePat
 static List * GetSortDetails(PlannerInfo *root, Index rti,
 							 bool *hasOrderBy, bool *hasGroupby, bool *isOrderById);
 static bool IsValidIndexPathForIdOrderBy(IndexPath *indexPath, List *sortDetails);
-static bool IsValidForIndexOnlyScans(PlannerInfo *root);
+static bool IsValidForIndexOnlyScans(PlannerInfo *root, List **requiredPathsOut);
 
 /*-------------------------------*/
 /* Force index support functions */
@@ -1354,32 +1354,162 @@ ForceIndexForQueryOperators(PlannerInfo *root, RelOptInfo *rel,
 }
 
 
+/*
+ * State for WalkProjectionForIndexOnly: collects the document paths the index
+ * must be able to reconstruct for the projection to be covered, or flags the
+ * projection as unsupported when it references the document in a form we
+ * cannot reconstruct from composite index terms.
+ */
+typedef struct IndexOnlyProjectionState
+{
+	bool hasUnsupportedReference;
+	List *requiredPaths;
+} IndexOnlyProjectionState;
+
+
+/*
+ * Requires a single non-dotted path for the covered projection. Dotted paths
+ * are rejected because the index term reconstruction writes the index path as
+ * a literal top-level key (e.g. "a.b") while projection expressions traverse
+ * nested documents.
+ */
 static bool
-ProjectionReferencesDocumentVar(Expr *node, void *state)
+AddRequiredPathForIndexOnly(IndexOnlyProjectionState *state, const char *path,
+							uint32_t pathLength)
+{
+	if (pathLength == 0 || memchr(path, '.', pathLength) != NULL)
+	{
+		state->hasUnsupportedReference = true;
+		return false;
+	}
+
+	state->requiredPaths = lappend(state->requiredPaths,
+								   pnstrdup(path, pathLength));
+	return true;
+}
+
+
+/*
+ * Walks a projection expression and decides whether every reference to the
+ * document Var sits inside an expression whose result can be computed from
+ * the reconstructed composite index key (see gin_bson_composite_ordering_transform):
+ *   - bson_distinct_unwind(document, 'path'::text)   [distinct]
+ *   - bson_expression_get(document, '{"..": "$path"}', ...) [group keys, $sum: "$path"]
+ * Collects the referenced paths; any other Var (or subquery) reference makes
+ * the projection uncoverable.
+ */
+static bool
+WalkProjectionForIndexOnly(Node *node, IndexOnlyProjectionState *state)
 {
 	CHECK_FOR_INTERRUPTS();
 
-	if (node == NULL)
+	if (node == NULL || state->hasUnsupportedReference)
+	{
+		return state->hasUnsupportedReference;
+	}
+
+	if (IsA(node, FuncExpr))
+	{
+		FuncExpr *funcExpr = (FuncExpr *) node;
+
+		if (funcExpr->funcid == BsonDistinctUnwindFunctionOid() &&
+			list_length(funcExpr->args) == 2 &&
+			IsA(linitial(funcExpr->args), Var) &&
+			IsA(lsecond(funcExpr->args), Const))
+		{
+			Const *pathConst = lsecond(funcExpr->args);
+			if (pathConst->constisnull || pathConst->consttype != TEXTOID)
+			{
+				state->hasUnsupportedReference = true;
+				return true;
+			}
+
+			text *pathText = DatumGetTextPP(pathConst->constvalue);
+			AddRequiredPathForIndexOnly(state, VARDATA_ANY(pathText),
+										VARSIZE_ANY_EXHDR(pathText));
+			return state->hasUnsupportedReference;
+		}
+
+		if (funcExpr->funcid == BsonExpressionGetFunctionOid() &&
+			list_length(funcExpr->args) == 3 &&
+			IsA(linitial(funcExpr->args), Var) &&
+			IsA(lsecond(funcExpr->args), Const))
+		{
+			Const *specConst = lsecond(funcExpr->args);
+			pgbsonelement specElement = { 0 };
+			if (specConst->constisnull ||
+				specConst->consttype != BsonTypeId() ||
+				!TryGetSinglePgbsonElementFromPgbson(
+					DatumGetPgBson(specConst->constvalue), &specElement) ||
+				specElement.bsonValue.value_type != BSON_TYPE_UTF8 ||
+				specElement.bsonValue.value.v_utf8.len < 2 ||
+				specElement.bsonValue.value.v_utf8.str[0] != '$' ||
+				specElement.bsonValue.value.v_utf8.str[1] == '$')
+			{
+				state->hasUnsupportedReference = true;
+				return true;
+			}
+
+			AddRequiredPathForIndexOnly(state,
+										specElement.bsonValue.value.v_utf8.str + 1,
+										specElement.bsonValue.value.v_utf8.len - 1);
+			return state->hasUnsupportedReference;
+		}
+	}
+
+	if (IsA(node, Var) || IsA(node, Query))
+	{
+		state->hasUnsupportedReference = true;
+		return true;
+	}
+
+	return expression_tree_walker(node, WalkProjectionForIndexOnly, state);
+}
+
+
+/*
+ * True when the OpExpr is a fullScan/orderByScan pushdown marker built by
+ * CreateFullScanOpExpr: a range-match operator whose query const is a single
+ * element of the form { "path": { "fullScan": true } } or
+ * { "path": { "orderByScan": N } }. These match every document exactly, as
+ * opposed to real $range clauses which carry min/max bounds.
+ */
+static bool
+IsFullScanMarkerRangeClause(OpExpr *opExpr)
+{
+	if (opExpr->opno != BsonRangeMatchOperatorOid() ||
+		list_length(opExpr->args) != 2)
 	{
 		return false;
 	}
 
-	if (IsA(node, Var))
+	Expr *secondArg = lsecond(opExpr->args);
+	if (!IsA(secondArg, Const))
 	{
-		/* If we have any vars, just return true */
-		bool *isFound = (bool *) state;
-		*isFound = true;
-		return false;
-	}
-	else if (IsA(node, Query))
-	{
-		/* A projection with a subquery - don't apply indexonlyscan optimization */
-		bool *isFound = (bool *) state;
-		*isFound = true;
 		return false;
 	}
 
-	return expression_tree_walker((Node *) node, ProjectionReferencesDocumentVar, state);
+	Const *queryConst = (Const *) secondArg;
+	pgbsonelement queryElement = { 0 };
+	if (queryConst->constisnull ||
+		queryConst->consttype != BsonTypeId() ||
+		!TryGetSinglePgbsonElementFromPgbson(
+			DatumGetPgBson(queryConst->constvalue), &queryElement) ||
+		queryElement.bsonValue.value_type != BSON_TYPE_DOCUMENT)
+	{
+		return false;
+	}
+
+	pgbsonelement innerElement = { 0 };
+	if (!TryGetBsonValueToPgbsonElement(&queryElement.bsonValue, &innerElement))
+	{
+		return false;
+	}
+
+	return (innerElement.pathLength == 8 &&
+			strncmp(innerElement.path, "fullScan", 8) == 0) ||
+		   (innerElement.pathLength == 11 &&
+			strncmp(innerElement.path, "orderByScan", 11) == 0);
 }
 
 
@@ -1425,6 +1555,15 @@ IndexClausesValidForIndexOnlyScan(IndexPath *indexPath,
 		return false;
 	}
 
+	if (indexPath->indexinfo->indpred != NIL)
+	{
+		/* A partial index (partialFilterExpression / sparse) does not see all
+		 * documents, so it cannot answer covered projections for the whole
+		 * collection.
+		 */
+		return false;
+	}
+
 	ListCell *clauseCell;
 	foreach(clauseCell, indexPath->indexclauses)
 	{
@@ -1448,17 +1587,27 @@ IndexClausesValidForIndexOnlyScan(IndexPath *indexPath,
 		}
 
 		OpExpr *opExpr = (OpExpr *) rinfo->clause;
-		const MongoIndexOperatorInfo *indexOperator =
-			GetMongoIndexOperatorByPostgresOperatorId(opExpr->opno);
-
-		if (!IndexStrategySupportsIndexOnlyScan(indexOperator->indexStrategy))
-		{
-			return false;
-		}
 
 		/* TODO (IndexOnlyScan): can we support null equality? */
 		Expr *secondArg = lsecond(opExpr->args);
 		if (!IsA(secondArg, Const))
+		{
+			return false;
+		}
+
+		if (IsFullScanMarkerRangeClause(opExpr))
+		{
+			/* fullScan/orderByScan marker generated for orderby/group/distinct
+			 * pushdown (see CreateFullScanOpExpr): matches every document and
+			 * is exact, so it is always valid for an index only scan.
+			 */
+			continue;
+		}
+
+		const MongoIndexOperatorInfo *indexOperator =
+			GetMongoIndexOperatorByPostgresOperatorId(opExpr->opno);
+
+		if (!IndexStrategySupportsIndexOnlyScan(indexOperator->indexStrategy))
 		{
 			return false;
 		}
@@ -1482,6 +1631,16 @@ IndexClausesValidForIndexOnlyScan(IndexPath *indexPath,
 				continue;
 			}
 
+			if (IsA(clause, FuncExpr) &&
+				(((FuncExpr *) clause)->funcid == BsonFullScanFunctionOid() ||
+				 ((FuncExpr *) clause)->funcid == BsonIndexHintFunctionOid()))
+			{
+				/* Pushdown markers that match every document; trimmed from the
+				 * final plan (see ReplaceExtensionFunctionOperatorsCore).
+				 */
+				continue;
+			}
+
 			return false;
 		}
 
@@ -1491,6 +1650,12 @@ IndexClausesValidForIndexOnlyScan(IndexPath *indexPath,
 		if (!IsA(secondArg, Const))
 		{
 			return false;
+		}
+
+		if (IsFullScanMarkerRangeClause(opExpr))
+		{
+			/* fullScan/orderByScan pushdown marker: matches every document. */
+			continue;
 		}
 
 		const MongoIndexOperatorInfo *indexOperator =
@@ -1532,32 +1697,215 @@ PlanHasAggregates(PlannerInfo *root)
 
 
 static bool
-IsValidForIndexOnlyScans(PlannerInfo *root)
+IsValidForIndexOnlyScans(PlannerInfo *root, List **requiredPathsOut)
 {
+	*requiredPathsOut = NIL;
+
 	if (!PlanHasAggregates(root) ||
 		root->hasJoinRTEs)
 	{
 		/* Don't handle simple queries for now - only things with aggregates
 		 * Note: Things like GroupBy with no aggregates will not work here, but
 		 * that's okay. We also only consider base tables for index only scans.
-		 * TODO: This can also be extended to handle covered indexes later.
 		 */
 		return false;
 	}
 
-	bool projectionHasVarOrQuery = false;
+	/* The projection is covered when every document reference sits inside an
+	 * expression computable from the reconstructed composite index key
+	 * (distinct unwind / expression_get over indexed paths); requiredPathsOut
+	 * returns the paths the index must reconstruct - NIL preserves the
+	 * original const-only projection behavior.
+	 */
+	IndexOnlyProjectionState projectionState = { 0 };
 	expression_tree_walker((Node *) root->processed_tlist,
-						   ProjectionReferencesDocumentVar,
-						   &projectionHasVarOrQuery);
-	if (projectionHasVarOrQuery)
+						   WalkProjectionForIndexOnly,
+						   &projectionState);
+	if (projectionState.hasUnsupportedReference)
 	{
-		/* If the projection has a Var or a Query, we can't do index only scan
-		 * because we can't cover the projection.
-		 */
+		list_free_deep(projectionState.requiredPaths);
+		return false;
+	}
+
+	*requiredPathsOut = projectionState.requiredPaths;
+	return true;
+}
+
+
+/*
+ * Checks that every path in requiredPaths is a column of the composite index,
+ * i.e. the index key reconstruction covers the projection's references.
+ */
+static bool
+CompositeIndexCoversPaths(IndexOptInfo *indexinfo, List *requiredPaths)
+{
+	if (indexinfo->opclassoptions == NULL || indexinfo->opclassoptions[0] == NULL)
+	{
+		return false;
+	}
+
+	void *options = (void *) indexinfo->opclassoptions[0];
+	ListCell *cell;
+	foreach(cell, requiredPaths)
+	{
+		const char *path = (const char *) lfirst(cell);
+		int8_t sortDirection = 0;
+		if (GetCompositeOpClassColumnNumber(path, options, &sortDirection) < 0)
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * True when every base restriction on the rel is a shard key equality or a
+ * pushdown marker (fullScan/orderByScan/index hint). Used to decide whether a
+ * synthesized full-index index-only path returns exactly the collection's
+ * documents.
+ */
+static bool
+RelHasOnlyShardKeyOrMarkerQuals(RelOptInfo *rel)
+{
+	ListCell *cell;
+	foreach(cell, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(cell);
+		Expr *clause = rinfo->clause;
+
+		if (IsA(clause, OpExpr))
+		{
+			OpExpr *opExpr = (OpExpr *) clause;
+			if (IsFullScanMarkerRangeClause(opExpr))
+			{
+				continue;
+			}
+
+			if (opExpr->opno == BigintEqualOperatorId() &&
+				list_length(opExpr->args) == 2 &&
+				IsA(linitial(opExpr->args), Var) &&
+				IsA(lsecond(opExpr->args), Const) &&
+				((Var *) linitial(opExpr->args))->varattno ==
+				DOCUMENT_DATA_TABLE_SHARD_KEY_VALUE_VAR_ATTR_NUMBER)
+			{
+				continue;
+			}
+
+			return false;
+		}
+
+		if (IsA(clause, FuncExpr) &&
+			(((FuncExpr *) clause)->funcid == BsonFullScanFunctionOid() ||
+			 ((FuncExpr *) clause)->funcid == BsonIndexHintFunctionOid()))
+		{
+			continue;
+		}
+
 		return false;
 	}
 
 	return true;
+}
+
+
+/*
+ * Builds an index-only IndexPath over a composite index that fully covers the
+ * projection's required paths. Used when the corresponding plain index path
+ * did not survive add_path (e.g. hash-based DISTINCT provides no useful
+ * pathkeys, so the ordered RUM path loses to the primary key scan on cost
+ * before the index-only conversion can be applied).
+ */
+static IndexPath *
+TryBuildCoveredIndexOnlyPath(PlannerInfo *root, RelOptInfo *rel, Index rti,
+							 List *requiredPaths)
+{
+	if (!RelHasOnlyShardKeyOrMarkerQuals(rel))
+	{
+		return NULL;
+	}
+
+	ListCell *indexCell;
+	foreach(indexCell, rel->indexlist)
+	{
+		IndexOptInfo *indexinfo = (IndexOptInfo *) lfirst(indexCell);
+
+		if (indexinfo->relam == BTREE_AM_OID ||
+			indexinfo->nkeycolumns < 1 ||
+			indexinfo->indpred != NIL ||
+			indexinfo->opclassoptions == NULL ||
+			indexinfo->opclassoptions[0] == NULL)
+		{
+			continue;
+		}
+
+		if (!IsOrderBySupportedOnOpClass(indexinfo->relam,
+										 indexinfo->opfamily[0]))
+		{
+			continue;
+		}
+
+		if (!CompositeIndexSupportsIndexOnlyScan(indexinfo) ||
+			!CompositeIndexCoversPaths(indexinfo, requiredPaths))
+		{
+			continue;
+		}
+
+		bool isWildcard = false;
+		const char *firstIndexPath = GetFirstPathFromIndexOptionsIfApplicable(
+			indexinfo->opclassoptions[0], &isWildcard);
+		if (firstIndexPath == NULL || isWildcard)
+		{
+			continue;
+		}
+
+		/* The orderByScan marker engages the ordered RUM scan machinery that
+		 * index-only scans require (see startScan in the extended RUM AM).
+		 */
+		Var *documentVar = makeVar(rti,
+								   DOCUMENT_DATA_TABLE_DOCUMENT_VAR_ATTR_NUMBER,
+								   BsonTypeId(), -1, InvalidOid, 0);
+		int32_t ascendingOrderByScan = 1;
+		OpExpr *scanClause = CreateFullScanOpExpr((Expr *) documentVar,
+												  firstIndexPath,
+												  strlen(firstIndexPath),
+												  ascendingOrderByScan);
+
+		RestrictInfo *scanRestrictInfo =
+			make_simple_restrictinfo(root, (Expr *) scanClause);
+		IndexClause *indexClause = makeNode(IndexClause);
+		indexClause->rinfo = scanRestrictInfo;
+		indexClause->indexquals = list_make1(scanRestrictInfo);
+		indexClause->lossy = false;
+		indexClause->indexcol = 0;
+		indexClause->indexcols = NIL;
+
+		IndexOptInfo *indexinfoCopy = palloc(sizeof(IndexOptInfo));
+		memcpy(indexinfoCopy, indexinfo, sizeof(IndexOptInfo));
+		indexinfoCopy->canreturn = palloc0(sizeof(bool) *
+										   indexinfoCopy->ncolumns);
+		indexinfoCopy->canreturn[0] = true;
+
+		/* RelHasOnlyShardKeyOrMarkerQuals guaranteed every base restriction is
+		 * either provably true on this rel (shard key equality on an unsharded
+		 * collection) or a pushdown marker. None of them can (or need to) be
+		 * evaluated over the reconstructed index tuple, so keep them out of
+		 * the plan's qpquals.
+		 */
+		indexinfoCopy->indrestrictinfo = NIL;
+
+		bool indexOnly = true;
+		bool partialPath = false;
+		IndexPath *newPath = create_index_path(root, indexinfoCopy,
+											   list_make1(indexClause),
+											   NIL, NIL, NIL,
+											   ForwardScanDirection, indexOnly,
+											   NULL, 1, partialPath);
+		return newPath;
+	}
+
+	return NULL;
 }
 
 
@@ -1581,7 +1929,8 @@ ConsiderIndexOnlyScan(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 		return;
 	}
 
-	if (!IsValidForIndexOnlyScans(root))
+	List *requiredPaths = NIL;
+	if (!IsValidForIndexOnlyScans(root, &requiredPaths))
 	{
 		return;
 	}
@@ -1624,6 +1973,12 @@ ConsiderIndexOnlyScan(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 		if (IsBtreePrimaryKeyIndex(indexPath->indexinfo) &&
 			EnableIdIndexPushdown)
 		{
+			if (requiredPaths != NIL)
+			{
+				/* The primary key btree cannot reconstruct document paths */
+				continue;
+			}
+
 			if (EnableIdIndexCustomCostFunction && !ForceIndexOnlyScanIfAvailable)
 			{
 				continue;
@@ -1658,7 +2013,13 @@ ConsiderIndexOnlyScan(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 				continue;
 			}
 
-			if (!CompositeIndexSupportsIndexOnlyScan(indexPath))
+			if (!CompositeIndexSupportsIndexOnlyScan(indexPath->indexinfo))
+			{
+				continue;
+			}
+
+			if (requiredPaths != NIL &&
+				!CompositeIndexCoversPaths(indexPath->indexinfo, requiredPaths))
 			{
 				continue;
 			}
@@ -1699,6 +2060,19 @@ ConsiderIndexOnlyScan(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 		cost_index(indexPathCopy, root, loopCount, partialPath);
 
 		addedPaths = lappend(addedPaths, indexPathCopy);
+	}
+
+	if (requiredPaths != NIL && addedPaths == NIL)
+	{
+		/* A covered projection whose source index path was pruned by add_path:
+		 * synthesize the index-only path directly from the index list.
+		 */
+		IndexPath *coveredPath = TryBuildCoveredIndexOnlyPath(root, rel, rti,
+															  requiredPaths);
+		if (coveredPath != NULL)
+		{
+			addedPaths = lappend(addedPaths, coveredPath);
+		}
 	}
 
 	if (ForceIndexOnlyScanIfAvailable &&
@@ -1792,9 +2166,14 @@ documentdb_btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		ConsiderBtreeOrderByPushdown(root, path);
 	}
 
+	List *btreeRequiredPaths = NIL;
 	if (EnableIdIndexCustomCostFunction && EnableIndexOnlyScan &&
-		IsValidForIndexOnlyScans(root))
+		IsValidForIndexOnlyScans(root, &btreeRequiredPaths) &&
+		btreeRequiredPaths == NIL)
 	{
+		/* Only convert when the projection references no document paths -
+		 * the primary key btree cannot reconstruct them.
+		 */
 		bool hasOtherQuals = false;
 		IndexPath *modified = TrimIndexRestrictInfoForBtreePath(root, path,
 																&hasOtherQuals);
@@ -1810,6 +2189,8 @@ documentdb_btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 			pfree(modified);
 		}
 	}
+
+	list_free_deep(btreeRequiredPaths);
 
 	btcostestimate(root, path, loop_count, indexStartupCost, indexTotalCost,
 				   indexSelectivity, indexCorrelation, indexPages);

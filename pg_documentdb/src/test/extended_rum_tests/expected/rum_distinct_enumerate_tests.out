@@ -1,0 +1,330 @@
+SET search_path TO documentdb_api,documentdb_core,documentdb_api_catalog;
+SET documentdb.next_collection_id TO 8300;
+SET documentdb.next_collection_index_id TO 8300;
+set documentdb.enableIndexDistinctScan to on;
+-- base collection: 4 values, literal null, missing path
+SELECT COUNT(documentdb_api.insert_one('rdedb', 'rdec',
+    FORMAT('{ "_id": %s, "st": "S%s", "v": %s }', i, i % 4, i)::bson))
+FROM generate_series(1, 40) i;
+NOTICE:  creating collection
+ count 
+-------
+    40
+(1 row)
+
+SELECT 1 FROM documentdb_api.insert_one('rdedb', 'rdec', '{ "_id": 100, "v": 100 }');
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT 1 FROM documentdb_api.insert_one('rdedb', 'rdec', '{ "_id": 101, "st": null, "v": 101 }');
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently('rdedb',
+  '{ "createIndexes": "rdec", "indexes": [ { "key": { "st": 1 }, "enableCompositeTerm": true, "name": "st_1" } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+-- the fast path takes over the whole plan
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_distinct('rdedb', '{ "distinct": "rdec", "key": "st" }');
+ QUERY PLAN 
+------------
+ Result
+(1 row)
+
+-- values are exact and ordered; heap fallback agrees on the set
+SELECT documentdb_api.distinct_query('rdedb', '{ "distinct": "rdec", "key": "st" }');
+                                   distinct_query                                    
+-------------------------------------------------------------------------------------
+ { "values" : [ null, "S0", "S1", "S2", "S3" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+set documentdb.enableIndexDistinctScan to off;
+SELECT documentdb_api.distinct_query('rdedb', '{ "distinct": "rdec", "key": "st" }');
+                                   distinct_query                                    
+-------------------------------------------------------------------------------------
+ { "values" : [ null, "S0", "S3", "S1", "S2" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+set documentdb.enableIndexDistinctScan to on;
+-- MVCC: a value deleted in this transaction disappears without vacuum
+BEGIN;
+SELECT 1 FROM documentdb_api.delete('rdedb', '{ "delete": "rdec", "deletes": [ { "q": { "st": "S3" }, "limit": 0 } ]}');
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT documentdb_api.distinct_query('rdedb', '{ "distinct": "rdec", "key": "st" }');
+                                distinct_query                                 
+-------------------------------------------------------------------------------
+ { "values" : [ null, "S0", "S1", "S2" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+ROLLBACK;
+-- ... and comes back after rollback
+SELECT documentdb_api.distinct_query('rdedb', '{ "distinct": "rdec", "key": "st" }');
+                                   distinct_query                                    
+-------------------------------------------------------------------------------------
+ { "values" : [ null, "S0", "S1", "S2", "S3" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+-- MVCC: dead entries left by a committed delete stay suppressed pre-vacuum
+SELECT 1 FROM documentdb_api.delete('rdedb', '{ "delete": "rdec", "deletes": [ { "q": { "st": "S2" }, "limit": 0 } ]}');
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT documentdb_api.distinct_query('rdedb', '{ "distinct": "rdec", "key": "st" }');
+                                distinct_query                                 
+-------------------------------------------------------------------------------
+ { "values" : [ null, "S0", "S1", "S3" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT FORMAT('VACUUM documentdb_data.documents_%s', collection_id) FROM documentdb_api_catalog.collections WHERE collection_name = 'rdec' \gexec
+VACUUM documentdb_data.documents_8301
+SELECT documentdb_api.distinct_query('rdedb', '{ "distinct": "rdec", "key": "st" }');
+                                distinct_query                                 
+-------------------------------------------------------------------------------
+ { "values" : [ null, "S0", "S1", "S3" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+-- MVCC: own-transaction inserts are visible; rolled back inserts are not
+BEGIN;
+SELECT 1 FROM documentdb_api.insert_one('rdedb', 'rdec', '{ "_id": 200, "st": "SNEW" }');
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT documentdb_api.distinct_query('rdedb', '{ "distinct": "rdec", "key": "st" }');
+                                    distinct_query                                     
+---------------------------------------------------------------------------------------
+ { "values" : [ null, "S0", "S1", "S3", "SNEW" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+ROLLBACK;
+SELECT documentdb_api.distinct_query('rdedb', '{ "distinct": "rdec", "key": "st" }');
+                                distinct_query                                 
+-------------------------------------------------------------------------------
+ { "values" : [ null, "S0", "S1", "S3" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+-- MVCC: an update moves the document between values in the same transaction
+BEGIN;
+SELECT 1 FROM documentdb_api.update('rdedb', '{ "update": "rdec", "updates": [ { "q": { "st": "S1" }, "u": { "$set": { "st": "S1B" } }, "multi": true } ]}');
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT documentdb_api.distinct_query('rdedb', '{ "distinct": "rdec", "key": "st" }');
+                                 distinct_query                                 
+--------------------------------------------------------------------------------
+ { "values" : [ null, "S0", "S1B", "S3" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+ROLLBACK;
+-- a filter keeps the regular distinct plan
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_distinct('rdedb', '{ "distinct": "rdec", "key": "st", "query": { "v": { "$gt": 10 } } }');
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Aggregate
+   ->  HashAggregate
+         Group Key: bson_distinct_unwind(collection.document, 'st'::text)
+         ->  ProjectSet
+               ->  Seq Scan on documents_8301 collection
+                     Filter: (document @> '{ "v" : { "$numberInt" : "10" } }'::bson)
+(6 rows)
+
+-- a value with a posting tree (many documents) still enumerates once
+SELECT COUNT(documentdb_api.insert_one('rdedb', 'rdebig',
+    FORMAT('{ "_id": %s, "st": "BIG" }', i)::bson))
+FROM generate_series(1, 3000) i;
+NOTICE:  creating collection
+ count 
+-------
+  3000
+(1 row)
+
+SELECT 1 FROM documentdb_api.insert_one('rdedb', 'rdebig', '{ "_id": 100000, "st": "TINY" }');
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently('rdedb',
+  '{ "createIndexes": "rdebig", "indexes": [ { "key": { "st": 1 }, "enableCompositeTerm": true, "name": "st_1" } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+SELECT documentdb_api.distinct_query('rdedb', '{ "distinct": "rdebig", "key": "st" }');
+                            distinct_query                            
+----------------------------------------------------------------------
+ { "values" : [ "BIG", "TINY" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+-- ... and dies correctly when every document of the big value is deleted
+SELECT 1 FROM documentdb_api.delete('rdedb', '{ "delete": "rdebig", "deletes": [ { "q": { "st": "BIG" }, "limit": 0 } ]}');
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT documentdb_api.distinct_query('rdedb', '{ "distinct": "rdebig", "key": "st" }');
+                        distinct_query                         
+---------------------------------------------------------------
+ { "values" : [ "TINY" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+-- arrays (multikey) fall back to the heap distinct with element semantics
+SELECT 1 FROM documentdb_api.insert_one('rdedb', 'rdemk', '{ "_id": 1, "st": ["a", "b"] }');
+NOTICE:  creating collection
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT 1 FROM documentdb_api.insert_one('rdedb', 'rdemk', '{ "_id": 2, "st": "c" }');
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently('rdedb',
+  '{ "createIndexes": "rdemk", "indexes": [ { "key": { "st": 1 }, "enableCompositeTerm": true, "name": "st_1" } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+SELECT documentdb_api.distinct_query('rdedb', '{ "distinct": "rdemk", "key": "st" }');
+                            distinct_query                            
+----------------------------------------------------------------------
+ { "values" : [ "a", "c", "b" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+-- truncated terms fall back
+SELECT 1 FROM documentdb_api.insert_one('rdedb', 'rdetrunc', FORMAT('{ "_id": 1, "st": "%s" }', repeat('y', 4000))::bson);
+NOTICE:  creating collection
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT 1 FROM documentdb_api.insert_one('rdedb', 'rdetrunc', '{ "_id": 2, "st": "small" }');
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently('rdedb',
+  '{ "createIndexes": "rdetrunc", "indexes": [ { "key": { "st": 1 }, "enableCompositeTerm": true, "name": "st_1" } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+SELECT LENGTH(documentdb_core.bson_to_json_string(documentdb_api.distinct_query('rdedb', '{ "distinct": "rdetrunc", "key": "st" }'))::text) > 100;
+ ?column? 
+----------
+ t
+(1 row)
+
+-- partial filter expression indexes fall back
+SELECT COUNT(documentdb_api.insert_one('rdedb', 'rdepfe',
+    FORMAT('{ "_id": %s, "st": "S%s", "v": %s }', i, i % 2, i)::bson))
+FROM generate_series(1, 10) i;
+NOTICE:  creating collection
+ count 
+-------
+    10
+(1 row)
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently('rdedb',
+  '{ "createIndexes": "rdepfe", "indexes": [ { "key": { "st": 1 }, "enableCompositeTerm": true, "name": "st_pfe", "partialFilterExpression": { "v": { "$gt": 5 } } } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+SELECT documentdb_api.distinct_query('rdedb', '{ "distinct": "rdepfe", "key": "st" }');
+                          distinct_query                           
+-------------------------------------------------------------------
+ { "values" : [ "S0", "S1" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+-- descending index still enumerates (reverse key order is fine for distinct)
+SELECT COUNT(documentdb_api.insert_one('rdedb', 'rdedesc',
+    FORMAT('{ "_id": %s, "st": "S%s" }', i, i % 3)::bson))
+FROM generate_series(1, 12) i;
+NOTICE:  creating collection
+ count 
+-------
+    12
+(1 row)
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently('rdedb',
+  '{ "createIndexes": "rdedesc", "indexes": [ { "key": { "st": -1 }, "enableCompositeTerm": true, "name": "st_m1" } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+SELECT documentdb_api.distinct_query('rdedb', '{ "distinct": "rdedesc", "key": "st" }');
+                             distinct_query                              
+-------------------------------------------------------------------------
+ { "values" : [ "S2", "S1", "S0" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+-- empty collection
+SELECT documentdb_api.create_collection('rdedb', 'rdeempty');
+NOTICE:  creating collection
+ create_collection 
+-------------------
+ t
+(1 row)
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently('rdedb',
+  '{ "createIndexes": "rdeempty", "indexes": [ { "key": { "st": 1 }, "enableCompositeTerm": true, "name": "st_1" } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+SELECT documentdb_api.distinct_query('rdedb', '{ "distinct": "rdeempty", "key": "st" }');
+                     distinct_query                      
+---------------------------------------------------------
+ { "values" : [  ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+-- collection without any candidate index keeps the regular plan
+SELECT 1 FROM documentdb_api.insert_one('rdedb', 'rdenoidx', '{ "_id": 1, "st": "x" }');
+NOTICE:  creating collection
+ ?column? 
+----------
+        1
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_distinct('rdedb', '{ "distinct": "rdenoidx", "key": "st" }');
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Aggregate
+   ->  HashAggregate
+         Group Key: bson_distinct_unwind(collection.document, 'st'::text)
+         ->  ProjectSet
+               ->  Bitmap Heap Scan on documents_8308 collection
+                     Recheck Cond: (shard_key_value = '8308'::bigint)
+                     ->  Bitmap Index Scan on _id_
+                           Index Cond: (shard_key_value = '8308'::bigint)
+(8 rows)
+

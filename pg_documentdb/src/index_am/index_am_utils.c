@@ -380,6 +380,19 @@ GetMultiKeyStatusByRelAm(Oid relam)
 }
 
 
+RumEnumerateVisibleEntriesFunc
+GetEnumerateVisibleEntriesFuncByRelAm(Oid relam)
+{
+	const BsonIndexAmEntry *amEntry = GetBsonIndexAmEntryByIndexOid(relam);
+	if (amEntry == NULL)
+	{
+		return NULL;
+	}
+
+	return amEntry->enumerate_visible_entries;
+}
+
+
 bool
 GetIndexSupportsBackwardsScan(Oid relam, bool *indexCanOrder)
 {

@@ -1,0 +1,410 @@
+SET search_path TO documentdb_api,documentdb_core,documentdb_api_catalog;
+SET documentdb.next_collection_id TO 7900;
+SET documentdb.next_collection_index_id TO 7900;
+set documentdb.enableIndexOrderbyPushdown to on;
+set documentdb.enableIndexOnlyScan to on;
+set seq_page_cost to 1000;
+-- 20 docs across 4 values, plus literal null and a missing path
+SELECT COUNT(documentdb_api.insert_one('diosdb', 'diosc',
+    FORMAT('{ "_id": %s, "st": "S%s", "v": %s }', i, i % 4, i)::bson))
+FROM generate_series(1, 20) i;
+NOTICE:  creating collection
+ count 
+-------
+    20
+(1 row)
+
+SELECT 1 FROM documentdb_api.insert_one('diosdb', 'diosc', '{ "_id": 100, "v": 100 }');
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT 1 FROM documentdb_api.insert_one('diosdb', 'diosc', '{ "_id": 101, "st": null, "v": 101 }');
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently('diosdb',
+  '{ "createIndexes": "diosc", "indexes": [ { "key": { "st": 1 }, "enableCompositeTerm": true, "name": "st_1" } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+SELECT FORMAT('VACUUM (ANALYZE ON, FREEZE ON) documentdb_data.documents_%s', collection_id) FROM documentdb_api_catalog.collections WHERE collection_name = 'diosc' \gexec
+VACUUM (ANALYZE ON, FREEZE ON) documentdb_data.documents_7901
+-- distinct is served by a covered index only scan
+EXPLAIN (ANALYZE ON, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT document FROM bson_aggregation_distinct('diosdb', '{ "distinct": "diosc", "key": "st" }');
+                                                  QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
+ Aggregate (actual rows=1 loops=1)
+   ->  HashAggregate (actual rows=5 loops=1)
+         Group Key: bson_distinct_unwind(collection.document, 'st'::text)
+         Batches: 1  Memory Usage: 49kB
+         ->  ProjectSet (actual rows=21 loops=1)
+               ->  Index Only Scan using st_1 on documents_7901 collection (actual rows=22 loops=1)
+                     Index Cond: (document @<> '{ "st" : { "orderByScan" : { "$numberInt" : "1" } } }'::bson)
+                     Heap Fetches: 0
+(8 rows)
+
+-- results: literal null included, missing path excluded; identical to the heap fallback
+SELECT documentdb_api.distinct_query('diosdb', '{ "distinct": "diosc", "key": "st" }');
+                                   distinct_query                                    
+-------------------------------------------------------------------------------------
+ { "values" : [ "S1", "S2", null, "S3", "S0" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+set documentdb.enableIndexOnlyScan to off;
+SELECT documentdb_api.distinct_query('diosdb', '{ "distinct": "diosc", "key": "st" }');
+                                   distinct_query                                    
+-------------------------------------------------------------------------------------
+ { "values" : [ "S1", "S2", null, "S3", "S0" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+set documentdb.enableIndexOnlyScan to on;
+-- group by the indexed key with a count: covered ordered scan, no heap access
+EXPLAIN (ANALYZE ON, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT document FROM bson_aggregation_pipeline('diosdb', '{ "aggregate": "diosc", "pipeline": [ { "$group": { "_id": "$st", "c": { "$sum": 1 } } } ], "cursor": {} }');
+                                               QUERY PLAN                                               
+--------------------------------------------------------------------------------------------------------
+ Subquery Scan on agg_stage_0 (actual rows=5 loops=1)
+   ->  GroupAggregate (actual rows=5 loops=1)
+         Group Key: bson_expression_get(collection.document, '{ "" : "$st" }'::bson, true)
+         ->  Index Only Scan using st_1 on documents_7901 collection (actual rows=22 loops=1)
+               Index Cond: (document @<> '{ "st" : { "orderByScan" : { "$numberInt" : "1" } } }'::bson)
+               Order By: (document |-<> '{ "st" : { "$numberInt" : "1" } }'::bson)
+               Heap Fetches: 0
+(7 rows)
+
+SELECT document FROM bson_aggregation_pipeline('diosdb', '{ "aggregate": "diosc", "pipeline": [ { "$group": { "_id": "$st", "c": { "$sum": 1 } } }, { "$sort": { "_id": 1 } } ], "cursor": {} }');
+                    document                    
+------------------------------------------------
+ { "_id" : null, "c" : { "$numberInt" : "2" } }
+ { "_id" : "S0", "c" : { "$numberInt" : "5" } }
+ { "_id" : "S1", "c" : { "$numberInt" : "5" } }
+ { "_id" : "S2", "c" : { "$numberInt" : "5" } }
+ { "_id" : "S3", "c" : { "$numberInt" : "5" } }
+(5 rows)
+
+set documentdb.enableIndexOnlyScan to off;
+SELECT document FROM bson_aggregation_pipeline('diosdb', '{ "aggregate": "diosc", "pipeline": [ { "$group": { "_id": "$st", "c": { "$sum": 1 } } }, { "$sort": { "_id": 1 } } ], "cursor": {} }');
+                    document                    
+------------------------------------------------
+ { "_id" : null, "c" : { "$numberInt" : "2" } }
+ { "_id" : "S0", "c" : { "$numberInt" : "5" } }
+ { "_id" : "S1", "c" : { "$numberInt" : "5" } }
+ { "_id" : "S2", "c" : { "$numberInt" : "5" } }
+ { "_id" : "S3", "c" : { "$numberInt" : "5" } }
+(5 rows)
+
+set documentdb.enableIndexOnlyScan to on;
+-- $sum over a second covered column
+SELECT documentdb_api_internal.create_indexes_non_concurrently('diosdb',
+  '{ "createIndexes": "diosc", "indexes": [ { "key": { "st": 1, "v": 1 }, "enableCompositeTerm": true, "name": "st_v" } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "2" }, "numIndexesAfter" : { "$numberInt" : "3" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+EXPLAIN (ANALYZE ON, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT document FROM bson_aggregation_pipeline('diosdb', '{ "aggregate": "diosc", "pipeline": [ { "$group": { "_id": "$st", "t": { "$sum": "$v" } } } ], "cursor": {} }');
+                                               QUERY PLAN                                               
+--------------------------------------------------------------------------------------------------------
+ Subquery Scan on agg_stage_0 (actual rows=5 loops=1)
+   ->  GroupAggregate (actual rows=5 loops=1)
+         Group Key: bson_expression_get(collection.document, '{ "" : "$st" }'::bson, true)
+         ->  Index Only Scan using st_v on documents_7901 collection (actual rows=22 loops=1)
+               Index Cond: (document @<> '{ "st" : { "orderByScan" : { "$numberInt" : "1" } } }'::bson)
+               Order By: (document |-<> '{ "st" : { "$numberInt" : "1" } }'::bson)
+               Heap Fetches: 0
+(7 rows)
+
+SELECT document FROM bson_aggregation_pipeline('diosdb', '{ "aggregate": "diosc", "pipeline": [ { "$group": { "_id": "$st", "t": { "$sum": "$v" } } }, { "$sort": { "_id": 1 } } ], "cursor": {} }');
+                     document                     
+--------------------------------------------------
+ { "_id" : null, "t" : { "$numberInt" : "201" } }
+ { "_id" : "S0", "t" : { "$numberInt" : "60" } }
+ { "_id" : "S1", "t" : { "$numberInt" : "45" } }
+ { "_id" : "S2", "t" : { "$numberInt" : "50" } }
+ { "_id" : "S3", "t" : { "$numberInt" : "55" } }
+(5 rows)
+
+-- a non-first column of a composite index is also covered
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_distinct('diosdb', '{ "distinct": "diosc", "key": "v" }');
+                                                  QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  HashAggregate
+         Group Key: bson_distinct_unwind(collection.document, 'v'::text)
+         ->  ProjectSet
+               ->  Index Only Scan using st_v on documents_7901 collection
+                     Index Cond: (document @<> '{ "st" : { "orderByScan" : { "$numberInt" : "1" } } }'::bson)
+(6 rows)
+
+SELECT documentdb_api.distinct_query('diosdb', '{ "distinct": "diosc", "key": "v" }');
+                                                                                                                                                                                                                                                                                                    distinct_query                                                                                                                                                                                                                                                                                                    
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "values" : [ { "$numberInt" : "6" }, { "$numberInt" : "8" }, { "$numberInt" : "19" }, { "$numberInt" : "2" }, { "$numberInt" : "100" }, { "$numberInt" : "18" }, { "$numberInt" : "5" }, { "$numberInt" : "7" }, { "$numberInt" : "15" }, { "$numberInt" : "14" }, { "$numberInt" : "20" }, { "$numberInt" : "17" }, { "$numberInt" : "10" }, { "$numberInt" : "11" }, { "$numberInt" : "101" }, { "$numberInt" : "16" }, { "$numberInt" : "9" }, { "$numberInt" : "3" }, { "$numberInt" : "13" }, { "$numberInt" : "4" }, { "$numberInt" : "1" }, { "$numberInt" : "12" } ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+set documentdb.enableIndexOnlyScan to off;
+SELECT documentdb_api.distinct_query('diosdb', '{ "distinct": "diosc", "key": "v" }');
+                                                                                                                                                                                                                                                                                                    distinct_query                                                                                                                                                                                                                                                                                                    
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "values" : [ { "$numberInt" : "6" }, { "$numberInt" : "8" }, { "$numberInt" : "19" }, { "$numberInt" : "2" }, { "$numberInt" : "100" }, { "$numberInt" : "18" }, { "$numberInt" : "5" }, { "$numberInt" : "7" }, { "$numberInt" : "15" }, { "$numberInt" : "14" }, { "$numberInt" : "20" }, { "$numberInt" : "17" }, { "$numberInt" : "10" }, { "$numberInt" : "11" }, { "$numberInt" : "101" }, { "$numberInt" : "16" }, { "$numberInt" : "9" }, { "$numberInt" : "3" }, { "$numberInt" : "13" }, { "$numberInt" : "4" }, { "$numberInt" : "1" }, { "$numberInt" : "12" } ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+set documentdb.enableIndexOnlyScan to on;
+-- dotted paths are not covered (index term reconstruction writes a literal top-level key)
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_distinct('diosdb', '{ "distinct": "diosc", "key": "st.x" }');
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Aggregate
+   ->  HashAggregate
+         Group Key: bson_distinct_unwind(collection.document, 'st.x'::text)
+         ->  ProjectSet
+               ->  Index Scan using _id_ on documents_7901 collection
+                     Index Cond: (shard_key_value = '7901'::bigint)
+(6 rows)
+
+-- an empty array makes the index multikey: exact fallback, [] is a distinct group key
+SELECT COUNT(documentdb_api.insert_one('diosdb', 'diosarr',
+    FORMAT('{ "_id": %s, "st": "S%s" }', i, i % 2)::bson))
+FROM generate_series(1, 10) i;
+NOTICE:  creating collection
+ count 
+-------
+    10
+(1 row)
+
+SELECT 1 FROM documentdb_api.insert_one('diosdb', 'diosarr', '{ "_id": 100, "st": [] }');
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT 1 FROM documentdb_api.insert_one('diosdb', 'diosarr', '{ "_id": 101 }');
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently('diosdb',
+  '{ "createIndexes": "diosarr", "indexes": [ { "key": { "st": 1 }, "enableCompositeTerm": true, "name": "st_1" } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+SELECT FORMAT('VACUUM (ANALYZE ON, FREEZE ON) documentdb_data.documents_%s', collection_id) FROM documentdb_api_catalog.collections WHERE collection_name = 'diosarr' \gexec
+VACUUM (ANALYZE ON, FREEZE ON) documentdb_data.documents_7902
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_distinct('diosdb', '{ "distinct": "diosarr", "key": "st" }');
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Aggregate
+   ->  HashAggregate
+         Group Key: bson_distinct_unwind(collection.document, 'st'::text)
+         ->  ProjectSet
+               ->  Index Scan using _id_ on documents_7902 collection
+                     Index Cond: (shard_key_value = '7902'::bigint)
+(6 rows)
+
+SELECT documentdb_api.distinct_query('diosdb', '{ "distinct": "diosarr", "key": "st" }');
+                          distinct_query                           
+-------------------------------------------------------------------
+ { "values" : [ "S1", "S0" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SELECT document FROM bson_aggregation_pipeline('diosdb', '{ "aggregate": "diosarr", "pipeline": [ { "$group": { "_id": "$st", "c": { "$sum": 1 } } }, { "$sort": { "_id": 1 } } ], "cursor": {} }');
+                    document                    
+------------------------------------------------
+ { "_id" : null, "c" : { "$numberInt" : "1" } }
+ { "_id" : [  ], "c" : { "$numberInt" : "1" } }
+ { "_id" : "S0", "c" : { "$numberInt" : "5" } }
+ { "_id" : "S1", "c" : { "$numberInt" : "5" } }
+(4 rows)
+
+-- non-empty arrays (multikey) also fall back
+SELECT 1 FROM documentdb_api.insert_one('diosdb', 'diosmk', '{ "_id": 1, "st": ["a", "b"] }');
+NOTICE:  creating collection
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT 1 FROM documentdb_api.insert_one('diosdb', 'diosmk', '{ "_id": 2, "st": "c" }');
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently('diosdb',
+  '{ "createIndexes": "diosmk", "indexes": [ { "key": { "st": 1 }, "enableCompositeTerm": true, "name": "st_1" } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+SELECT FORMAT('VACUUM (ANALYZE ON, FREEZE ON) documentdb_data.documents_%s', collection_id) FROM documentdb_api_catalog.collections WHERE collection_name = 'diosmk' \gexec
+VACUUM (ANALYZE ON, FREEZE ON) documentdb_data.documents_7903
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_distinct('diosdb', '{ "distinct": "diosmk", "key": "st" }');
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Aggregate
+   ->  HashAggregate
+         Group Key: bson_distinct_unwind(collection.document, 'st'::text)
+         ->  ProjectSet
+               ->  Index Scan using _id_ on documents_7903 collection
+                     Index Cond: (shard_key_value = '7903'::bigint)
+(6 rows)
+
+SELECT documentdb_api.distinct_query('diosdb', '{ "distinct": "diosmk", "key": "st" }');
+                            distinct_query                            
+----------------------------------------------------------------------
+ { "values" : [ "a", "c", "b" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+-- a partial filter expression index cannot serve covered projections
+SELECT COUNT(documentdb_api.insert_one('diosdb', 'diospfe',
+    FORMAT('{ "_id": %s, "st": "S%s", "v": %s }', i, i % 2, i)::bson))
+FROM generate_series(1, 10) i;
+NOTICE:  creating collection
+ count 
+-------
+    10
+(1 row)
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently('diosdb',
+  '{ "createIndexes": "diospfe", "indexes": [ { "key": { "st": 1 }, "enableCompositeTerm": true, "name": "st_pfe", "partialFilterExpression": { "v": { "$gt": 5 } } } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+SELECT FORMAT('VACUUM (ANALYZE ON, FREEZE ON) documentdb_data.documents_%s', collection_id) FROM documentdb_api_catalog.collections WHERE collection_name = 'diospfe' \gexec
+VACUUM (ANALYZE ON, FREEZE ON) documentdb_data.documents_7904
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_distinct('diosdb', '{ "distinct": "diospfe", "key": "st" }');
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Aggregate
+   ->  HashAggregate
+         Group Key: bson_distinct_unwind(collection.document, 'st'::text)
+         ->  ProjectSet
+               ->  Index Scan using _id_ on documents_7904 collection
+                     Index Cond: (shard_key_value = '7904'::bigint)
+(6 rows)
+
+SELECT documentdb_api.distinct_query('diosdb', '{ "distinct": "diospfe", "key": "st" }');
+                          distinct_query                           
+-------------------------------------------------------------------
+ { "values" : [ "S1", "S0" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+-- truncated terms disable the covered scan for the whole index
+SELECT 1 FROM documentdb_api.insert_one('diosdb', 'diostrunc', FORMAT('{ "_id": 1, "st": "%s" }', repeat('x', 4000))::bson);
+NOTICE:  creating collection
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT 1 FROM documentdb_api.insert_one('diosdb', 'diostrunc', '{ "_id": 2, "st": "small" }');
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently('diosdb',
+  '{ "createIndexes": "diostrunc", "indexes": [ { "key": { "st": 1 }, "enableCompositeTerm": true, "name": "st_1" } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+SELECT FORMAT('VACUUM (ANALYZE ON, FREEZE ON) documentdb_data.documents_%s', collection_id) FROM documentdb_api_catalog.collections WHERE collection_name = 'diostrunc' \gexec
+VACUUM (ANALYZE ON, FREEZE ON) documentdb_data.documents_7905
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_distinct('diosdb', '{ "distinct": "diostrunc", "key": "st" }');
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Aggregate
+   ->  HashAggregate
+         Group Key: bson_distinct_unwind(collection.document, 'st'::text)
+         ->  ProjectSet
+               ->  Index Scan using _id_ on documents_7905 collection
+                     Index Cond: (shard_key_value = '7905'::bigint)
+(6 rows)
+
+-- descending single-key composite index also serves the covered scan
+SELECT COUNT(documentdb_api.insert_one('diosdb', 'diosdesc',
+    FORMAT('{ "_id": %s, "st": "S%s" }', i, i % 3)::bson))
+FROM generate_series(1, 12) i;
+NOTICE:  creating collection
+ count 
+-------
+    12
+(1 row)
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently('diosdb',
+  '{ "createIndexes": "diosdesc", "indexes": [ { "key": { "st": -1 }, "enableCompositeTerm": true, "name": "st_m1" } ] }', true);
+                                                                                                   create_indexes_non_concurrently                                                                                                    
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+SELECT FORMAT('VACUUM (ANALYZE ON, FREEZE ON) documentdb_data.documents_%s', collection_id) FROM documentdb_api_catalog.collections WHERE collection_name = 'diosdesc' \gexec
+VACUUM (ANALYZE ON, FREEZE ON) documentdb_data.documents_7906
+EXPLAIN (ANALYZE ON, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT document FROM bson_aggregation_distinct('diosdb', '{ "distinct": "diosdesc", "key": "st" }');
+                                                  QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
+ Aggregate (actual rows=1 loops=1)
+   ->  HashAggregate (actual rows=3 loops=1)
+         Group Key: bson_distinct_unwind(collection.document, 'st'::text)
+         Batches: 1  Memory Usage: 37kB
+         ->  ProjectSet (actual rows=12 loops=1)
+               ->  Index Only Scan using st_m1 on documents_7906 collection (actual rows=12 loops=1)
+                     Index Cond: (document @<> '{ "st" : { "orderByScan" : { "$numberInt" : "1" } } }'::bson)
+                     Heap Fetches: 0
+(8 rows)
+
+SELECT documentdb_api.distinct_query('diosdb', '{ "distinct": "diosdesc", "key": "st" }');
+                             distinct_query                              
+-------------------------------------------------------------------------
+ { "values" : [ "S1", "S0", "S2" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+set documentdb.enableIndexOnlyScan to off;
+SELECT documentdb_api.distinct_query('diosdb', '{ "distinct": "diosdesc", "key": "st" }');
+                             distinct_query                              
+-------------------------------------------------------------------------
+ { "values" : [ "S1", "S0", "S2" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+set documentdb.enableIndexOnlyScan to on;
+-- distinct with an indexable filter on the same key still covers via the filter clause
+EXPLAIN (ANALYZE ON, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT document FROM bson_aggregation_distinct('diosdb', '{ "distinct": "diosc", "key": "st", "query": { "st": { "$gt": "S1" } } }');
+                                             QUERY PLAN                                             
+----------------------------------------------------------------------------------------------------
+ Aggregate (actual rows=1 loops=1)
+   ->  HashAggregate (actual rows=2 loops=1)
+         Group Key: bson_distinct_unwind(collection.document, 'st'::text)
+         Batches: 1  Memory Usage: 37kB
+         ->  ProjectSet (actual rows=10 loops=1)
+               ->  Index Only Scan using st_1 on documents_7901 collection (actual rows=10 loops=1)
+                     Index Cond: (document @> '{ "st" : "S1" }'::bson)
+                     Heap Fetches: 0
+(8 rows)
+
+SELECT documentdb_api.distinct_query('diosdb', '{ "distinct": "diosc", "key": "st", "query": { "st": { "$gt": "S1" } } }');
+                          distinct_query                           
+-------------------------------------------------------------------
+ { "values" : [ "S3", "S2" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+set documentdb.enableIndexOnlyScan to off;
+SELECT documentdb_api.distinct_query('diosdb', '{ "distinct": "diosc", "key": "st", "query": { "st": { "$gt": "S1" } } }');
+                          distinct_query                           
+-------------------------------------------------------------------
+ { "values" : [ "S3", "S2" ], "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+set documentdb.enableIndexOnlyScan to on;

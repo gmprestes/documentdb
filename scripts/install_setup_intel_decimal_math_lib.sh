@@ -58,8 +58,9 @@ echo "Moving to $MATH_LIB_WITH_VERSION/lib/intelmathlib"
 cd $MATH_LIB_WITH_VERSION/lib/intelmathlib
 
 git init
-# This repo is based on Intel Decimal Floating-Point Math Library, with patches applied to support more architecture types
-git remote add origin https://git.launchpad.net/ubuntu/+source/intelrdfpmath
+# This repo is based on Intel Decimal Floating-Point Math Library, with patches applied to support more architecture types.
+# INTELRDFPMATH_REPO overrides the source (e.g. a local mirror when launchpad is unreachable).
+git remote add origin "${INTELRDFPMATH_REPO:-https://git.launchpad.net/ubuntu/+source/intelrdfpmath}"
 
 git fetch --depth 1 origin "$MATH_LIB_VERSION"
 git checkout FETCH_HEAD

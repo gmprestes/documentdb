@@ -23,3 +23,4 @@ GRANT pg_read_all_stats to __API_BG_WORKER_ROLE__;
 
 -- Killop access
 GRANT pg_signal_backend to __API_ADMIN_ROLE__;
+#include "udfs/aggregation/bson_distinct_index_scan--0.109-0.sql"

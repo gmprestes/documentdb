@@ -30,6 +30,7 @@
  #include <access/gin.h>
 
  #include "io/bson_core.h"
+ #include "io/bsonvalue_utils.h"
  #include "aggregation/bson_query_common.h"
  #include "opclass/bson_gin_common.h"
  #include "opclass/bson_gin_private.h"
@@ -1331,6 +1332,33 @@ gin_bson_composite_ordering_transform(PG_FUNCTION_ARGS)
 		for (int i = 0; i < numPaths; i++)
 		{
 			BsonIndexTerm *term = &compareTerm[i];
+
+			if (IsIndexTermValueUndefined(term) || IsIndexTermMaybeUndefined(term))
+			{
+				/* The path does not exist in the source document: omit the
+				 * field so projection expressions over the reconstructed
+				 * document see it as missing, matching heap semantics.
+				 * (Maybe-undefined only occurs alongside array terms, which
+				 * make the index multikey and ineligible for index-only
+				 * scans; handled here for defense in depth.) */
+				continue;
+			}
+
+			if (term->element.bsonValue.value_type == BSON_TYPE_UNDEFINED)
+			{
+				/* A literal-undefined term value means the source document
+				 * held an empty array at this path (see GenerateTermPath).
+				 * Empty arrays mark the index multikey, which keeps it out of
+				 * index-only scans, so this is defense in depth for indexes
+				 * built before that rule: reconstruct the empty array. */
+				bson_value_t emptyArrayValue = { 0 };
+				InitBsonValueAsEmptyArray(&emptyArrayValue);
+				PgbsonHeapWriterAppendValue(writer, indexPaths[i],
+											indexPathLengths[i],
+											&emptyArrayValue);
+				continue;
+			}
+
 			PgbsonHeapWriterAppendValue(writer, indexPaths[i], indexPathLengths[i],
 										&term->element.bsonValue);
 		}

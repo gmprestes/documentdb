@@ -94,6 +94,9 @@ bool EnableIndexOrderByReverse = DEFAULT_ENABLE_INDEX_ORDERBY_REVERSE;
 #define DEFAULT_ENABLE_INDEX_ONLY_SCAN false
 bool EnableIndexOnlyScan = DEFAULT_ENABLE_INDEX_ONLY_SCAN;
 
+#define DEFAULT_ENABLE_INDEX_DISTINCT_SCAN false
+bool EnableIndexDistinctScan = DEFAULT_ENABLE_INDEX_DISTINCT_SCAN;
+
 #define DEFAULT_ENABLE_ID_INDEX_CUSTOM_COST_FUNCTION true
 bool EnableIdIndexCustomCostFunction = DEFAULT_ENABLE_ID_INDEX_CUSTOM_COST_FUNCTION;
 
@@ -629,6 +632,13 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 		gettext_noop(
 			"Whether to enable index only scan for queries that can be satisfied by an index without accessing the table."),
 		NULL, &EnableIndexOnlyScan, DEFAULT_ENABLE_INDEX_ONLY_SCAN,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enableIndexDistinctScan", newGucPrefix),
+		gettext_noop(
+			"Whether to answer filter-less distinct commands by enumerating a covering index's entry tree."),
+		NULL, &EnableIndexDistinctScan, DEFAULT_ENABLE_INDEX_DISTINCT_SCAN,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(

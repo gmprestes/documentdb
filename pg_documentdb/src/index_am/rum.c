@@ -565,6 +565,7 @@ LoadRumRoutine(void)
 }
 
 
+
 /*
  * Custom cost estimation function for RUM.
  * While Function support handles matching against specific indexes
@@ -623,8 +624,11 @@ extension_rumcostestimate_core(PlannerInfo *root, IndexPath *path, double loop_c
 		 * the first column of the index matches the query path.
 		 * This is because using the composite index would require specifying
 		 * the first column.
+		 * Index-only scans are exempt: they are covered full-index ordered
+		 * scans by construction (driven by the fullScan/orderByScan marker),
+		 * so requiring a first-column filter would just price them out.
 		 */
-		if (!firstColumnSpecified)
+		if (!firstColumnSpecified && path->path.pathtype != T_IndexOnlyScan)
 		{
 			*indexStartupCost = 0;
 			*indexTotalCost = INFINITY;
@@ -655,13 +659,13 @@ extension_rumcostestimate_core(PlannerInfo *root, IndexPath *path, double loop_c
 
 /* Check if the index supports index-only scans based on the index rel am. */
 bool
-CompositeIndexSupportsIndexOnlyScan(const IndexPath *indexPath)
+CompositeIndexSupportsIndexOnlyScan(const IndexOptInfo *indexinfo)
 {
 	GetMultikeyStatusFunc getMultiKeyStatusFunc = NULL;
 	GetTruncationStatusFunc getTruncationStatusFunc = NULL;
 
-	bool supports = GetIndexAmSupportsIndexOnlyScan(indexPath->indexinfo->relam,
-													indexPath->indexinfo->opfamily[0],
+	bool supports = GetIndexAmSupportsIndexOnlyScan(indexinfo->relam,
+													indexinfo->opfamily[0],
 													&getMultiKeyStatusFunc,
 													&getTruncationStatusFunc);
 
@@ -671,10 +675,10 @@ CompositeIndexSupportsIndexOnlyScan(const IndexPath *indexPath)
 		return false;
 	}
 
-	if (indexPath->indexinfo->opclassoptions != NULL)
+	if (indexinfo->opclassoptions != NULL)
 	{
 		BsonGinIndexOptionsBase *options =
-			(BsonGinIndexOptionsBase *) indexPath->indexinfo->opclassoptions[0];
+			(BsonGinIndexOptionsBase *) indexinfo->opclassoptions[0];
 		if (options->type != IndexOptionsType_Composite)
 		{
 			return false;
@@ -695,7 +699,7 @@ CompositeIndexSupportsIndexOnlyScan(const IndexPath *indexPath)
 		}
 	}
 
-	Relation indexRelation = index_open(indexPath->indexinfo->indexoid, NoLock);
+	Relation indexRelation = index_open(indexinfo->indexoid, NoLock);
 	bool multiKeyStatus = getMultiKeyStatusFunc(indexRelation);
 	bool hasTruncatedTerms = getTruncationStatusFunc(indexRelation);
 	index_close(indexRelation, NoLock);
