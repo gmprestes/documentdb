@@ -1528,10 +1528,17 @@ GenerateTermPath(bson_iter_t *bsonIter, const char *basePath,
 					 * path-missing term in the entry tree (value-only terms
 					 * compare by value alone), so covered projections cannot
 					 * tell "[]" apart from "missing". Marking multikey keeps
-					 * such collections out of index-only scans.
+					 * such collections out of index-only scans. Wildcard
+					 * paths are skipped: they never serve index-only scans
+					 * and the flag would add a spurious multikey root term.
 					 */
-					context->getPathDataFunc(context->pathDataState,
-											 pathIndex)->hasArrayValues = true;
+					GinEntryPathData *arrayPathData =
+						context->getPathDataFunc(context->pathDataState,
+												 pathIndex);
+					if (!arrayPathData->skipGenerateTopLevelDocumentTerm)
+					{
+						arrayPathData->hasArrayValues = true;
+					}
 				}
 				else
 				{
