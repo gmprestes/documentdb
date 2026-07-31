@@ -1,0 +1,127 @@
+SET search_path TO documentdb_api,documentdb_core,documentdb_api_catalog;
+SET documentdb.next_collection_id TO 8600;
+SET documentdb.next_collection_index_id TO 8600;
+-- deterministic parallel plans
+set parallel_setup_cost to 0;
+set parallel_tuple_cost to 0;
+set min_parallel_table_scan_size to 0;
+set max_parallel_workers_per_gather to 2;
+SELECT COUNT(documentdb_api.insert_one('perfdb', 'perfc',
+    FORMAT('{ "_id": %s, "st": "S%s", "v": %s, "d": { "$date": { "$numberLong": "%s" } } }',
+           i, i % 4, i, 1700000000000::int8 + (i::int8 * 86400000))::bson))
+FROM generate_series(1, 100) i;
+NOTICE:  creating collection
+ count 
+-------
+   100
+(1 row)
+
+SELECT FORMAT('VACUUM (ANALYZE) documentdb_data.documents_%s', collection_id) FROM documentdb_api_catalog.collections WHERE collection_name = 'perfc' \gexec
+VACUUM (ANALYZE) documentdb_data.documents_8601
+-- aggregate support functions are parallel safe: $group + $sum plans a
+-- Finalize/Partial pair under the Gather
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_pipeline('perfdb', '{ "aggregate": "perfc", "pipeline": [ { "$group": { "_id": "$st", "q": { "$sum": "$v" } } } ], "cursor": {} }');
+                                              QUERY PLAN                                               
+-------------------------------------------------------------------------------------------------------
+ Subquery Scan on agg_stage_0
+   ->  Finalize HashAggregate
+         Group Key: (bson_expression_get(collection.document, '{ "" : "$st" }'::bson, true))
+         ->  Gather
+               Workers Planned: 2
+               ->  Partial HashAggregate
+                     Group Key: bson_expression_get(collection.document, '{ "" : "$st" }'::bson, true)
+                     ->  Parallel Seq Scan on documents_8601 collection
+(8 rows)
+
+SELECT document FROM bson_aggregation_pipeline('perfdb', '{ "aggregate": "perfc", "pipeline": [ { "$group": { "_id": "$st", "q": { "$sum": "$v" } } }, { "$sort": { "_id": 1 } } ], "cursor": {} }');
+                     document                      
+---------------------------------------------------
+ { "_id" : "S0", "q" : { "$numberInt" : "1300" } }
+ { "_id" : "S1", "q" : { "$numberInt" : "1225" } }
+ { "_id" : "S2", "q" : { "$numberInt" : "1250" } }
+ { "_id" : "S3", "q" : { "$numberInt" : "1275" } }
+(4 rows)
+
+-- date parts come from the local decomposition; results across operators
+SELECT document FROM bson_aggregation_pipeline('perfdb', '{ "aggregate": "perfc", "pipeline": [ { "$match": { "_id": { "$in": [1, 50, 100] } } }, { "$project": { "s": { "$dateToString": { "date": "$d", "format": "%Y-%m-%dT%H:%M:%S.%L j%j w%w U%U V%V G%G u%u", "timezone": "America/Sao_Paulo" } }, "parts": { "$dateToParts": { "date": "$d", "timezone": "Asia/Katmandu" } }, "wk": { "$week": "$d" }, "iso": { "$isoWeekYear": "$d" } } }, { "$sort": { "_id": 1 } } ], "cursor": {} }');
+                                                                                                                                                                                                                document                                                                                                                                                                                                                 
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "_id" : { "$numberInt" : "1" }, "s" : "2023-11-15T19:13:20.000 j319 w4 U46 V46 G2023 u3", "parts" : { "year" : { "$numberInt" : "2023" }, "month" : { "$numberInt" : "11" }, "day" : { "$numberInt" : "16" }, "hour" : { "$numberInt" : "3" }, "minute" : { "$numberInt" : "58" }, "second" : { "$numberInt" : "20" }, "millisecond" : { "$numberInt" : "0" } }, "wk" : { "$numberInt" : "46" }, "iso" : { "$numberLong" : "2023" } }
+ { "_id" : { "$numberInt" : "50" }, "s" : "2024-01-03T19:13:20.000 j003 w4 U00 V01 G2024 u3", "parts" : { "year" : { "$numberInt" : "2024" }, "month" : { "$numberInt" : "1" }, "day" : { "$numberInt" : "4" }, "hour" : { "$numberInt" : "3" }, "minute" : { "$numberInt" : "58" }, "second" : { "$numberInt" : "20" }, "millisecond" : { "$numberInt" : "0" } }, "wk" : { "$numberInt" : "0" }, "iso" : { "$numberLong" : "2024" } }
+ { "_id" : { "$numberInt" : "100" }, "s" : "2024-02-22T19:13:20.000 j053 w5 U07 V08 G2024 u4", "parts" : { "year" : { "$numberInt" : "2024" }, "month" : { "$numberInt" : "2" }, "day" : { "$numberInt" : "23" }, "hour" : { "$numberInt" : "3" }, "minute" : { "$numberInt" : "58" }, "second" : { "$numberInt" : "20" }, "millisecond" : { "$numberInt" : "0" } }, "wk" : { "$numberInt" : "7" }, "iso" : { "$numberLong" : "2024" } }
+(3 rows)
+
+-- default format + utc offset timezone
+SELECT document FROM bson_aggregation_pipeline('perfdb', '{ "aggregate": "perfc", "pipeline": [ { "$match": { "_id": 1 } }, { "$project": { "s": { "$dateToString": { "date": "$d" } }, "so": { "$dateToString": { "date": "$d", "timezone": "+05:45" } } } } ], "cursor": {} }');
+                                                document                                                 
+---------------------------------------------------------------------------------------------------------
+ { "_id" : { "$numberInt" : "1" }, "s" : "2023-11-15T22:13:20.000Z", "so" : "2023-11-16T03:58:20.000Z" }
+(1 row)
+
+-- facet: inline base gated behind the GUC; results identical either way
+set documentdb.enableFacetInlineBase to on;
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_pipeline('perfdb', '{ "aggregate": "perfc", "pipeline": [ { "$match": { "st": { "$in": ["S1", "S2"] } } }, { "$facet": { "a": [ { "$group": { "_id": "$st", "n": { "$sum": 1 } } }, { "$sort": { "_id": 1 } } ], "b": [ { "$count": "c" } ] } } ], "cursor": {} }');
+                                                                                                     QUERY PLAN                                                                                                      
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Append
+         ->  Aggregate
+               ->  Sort
+                     Sort Key: (bson_orderby(bson_repath_and_build(agg_stage_sub_1_0.c1, agg_stage_sub_1_0.c2, agg_stage_sub_1_0.c3, agg_stage_sub_1_0.c4), '{ "_id" : { "$numberInt" : "1" } }'::bson)) NULLS FIRST
+                     ->  Subquery Scan on agg_stage_sub_1_0
+                           ->  HashAggregate
+                                 Group Key: (bson_expression_get(collection.document, '{ "" : "$st" }'::bson, true))
+                                 ->  Gather
+                                       Workers Planned: 2
+                                       ->  Parallel Seq Scan on documents_8601 collection
+                                             Filter: (document @*= '{ "st" : [ "S1", "S2" ] }'::bson)
+         ->  Aggregate
+               ->  Finalize Aggregate
+                     ->  Gather
+                           Workers Planned: 2
+                           ->  Partial Aggregate
+                                 ->  Parallel Seq Scan on documents_8601 collection_1
+                                       Filter: (document @*= '{ "st" : [ "S1", "S2" ] }'::bson)
+(19 rows)
+
+SELECT document FROM bson_aggregation_pipeline('perfdb', '{ "aggregate": "perfc", "pipeline": [ { "$match": { "st": { "$in": ["S1", "S2"] } } }, { "$facet": { "a": [ { "$group": { "_id": "$st", "n": { "$sum": 1 } } }, { "$sort": { "_id": 1 } } ], "b": [ { "$count": "c" } ] } } ], "cursor": {} }');
+                                                                          document                                                                           
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "a" : [ { "_id" : "S1", "n" : { "$numberInt" : "25" } }, { "_id" : "S2", "n" : { "$numberInt" : "25" } } ], "b" : [ { "c" : { "$numberInt" : "50" } } ] }
+(1 row)
+
+set documentdb.enableFacetInlineBase to off;
+SELECT document FROM bson_aggregation_pipeline('perfdb', '{ "aggregate": "perfc", "pipeline": [ { "$match": { "st": { "$in": ["S1", "S2"] } } }, { "$facet": { "a": [ { "$group": { "_id": "$st", "n": { "$sum": 1 } } }, { "$sort": { "_id": 1 } } ], "b": [ { "$count": "c" } ] } } ], "cursor": {} }');
+                                                                          document                                                                           
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "a" : [ { "_id" : "S1", "n" : { "$numberInt" : "25" } }, { "_id" : "S2", "n" : { "$numberInt" : "25" } } ], "b" : [ { "c" : { "$numberInt" : "50" } } ] }
+(1 row)
+
+set documentdb.enableFacetInlineBase to on;
+-- $limit before $facet is not re-execution safe: base stays materialized
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_pipeline('perfdb', '{ "aggregate": "perfc", "pipeline": [ { "$limit": 10 }, { "$facet": { "a": [ { "$group": { "_id": "$st", "n": { "$sum": 1 } } } ], "b": [ { "$count": "c" } ] } } ], "cursor": {} }');
+                                                 QUERY PLAN                                                  
+-------------------------------------------------------------------------------------------------------------
+ Aggregate
+   CTE facet_base_1_0
+     ->  Limit
+           ->  Gather
+                 Workers Planned: 2
+                 ->  Parallel Seq Scan on documents_8601 collection
+   ->  Append
+         ->  Aggregate
+               ->  HashAggregate
+                     Group Key: bson_expression_get(facetsub_stage_1.document, '{ "" : "$st" }'::bson, true)
+                     ->  CTE Scan on facet_base_1_0 facetsub_stage_1
+         ->  Aggregate
+               ->  Aggregate
+                     ->  CTE Scan on facet_base_1_0 facetsub_stage_2
+(14 rows)
+
+-- single-branch facet keeps its existing plan shape
+SELECT document FROM bson_aggregation_pipeline('perfdb', '{ "aggregate": "perfc", "pipeline": [ { "$match": { "st": "S1" } }, { "$facet": { "only": [ { "$count": "c" } ] } } ], "cursor": {} }');
+                      document                      
+----------------------------------------------------
+ { "only" : [ { "c" : { "$numberInt" : "25" } } ] }
+(1 row)
+

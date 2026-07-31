@@ -358,6 +358,43 @@ HandleInternalInhibitOptimization(const bson_value_t *existingValue, Query *quer
 }
 
 
+extern bool EnableFacetInlineBase;
+
+/*
+ * True when re-executing the query once per facet branch is provably
+ * equivalent to executing it once: rejects LIMIT/OFFSET without a total
+ * order, DISTINCT and TABLESAMPLE ($sample) at any query level, since
+ * each of those can legally return a different row set per execution.
+ */
+static bool
+FacetBaseQueryIsSafeToInline(Query *query)
+{
+	if (query->limitCount != NULL || query->limitOffset != NULL ||
+		query->distinctClause != NIL)
+	{
+		return false;
+	}
+
+	ListCell *cell;
+	foreach(cell, query->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(cell);
+		if (rte->tablesample != NULL)
+		{
+			return false;
+		}
+
+		if (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL &&
+			!FacetBaseQueryIsSafeToInline(rte->subquery))
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
 /*
  * Processes the $facet Pipeine stage.
  * Injects a CTE for the current query.
@@ -387,6 +424,20 @@ HandleFacet(const bson_value_t *existingValue, Query *query,
 	baseCte->ctename = psprintf("facet_base_%d_%d", context->stageNum,
 								context->nestedPipelineLevel);
 	baseCte->ctequery = (Node *) query;
+
+	/* With CTEMaterializeDefault and 2+ branches PostgreSQL always
+	 * materializes the base and every branch scans the materialization
+	 * serially (CTE scans are parallel-restricted). When re-executing the
+	 * base per branch is provably equivalent - read-only, single snapshot,
+	 * "now" bound as a Const - allow inlining so each branch plans its own
+	 * (parallelizable) scan. $limit/$skip without a total order, $sample
+	 * and DISTINCT are not re-execution safe; keep those materialized.
+	 */
+	if (EnableFacetInlineBase && numStages > 1 &&
+		FacetBaseQueryIsSafeToInline(query))
+	{
+		baseCte->ctematerialized = CTEMaterializeNever;
+	}
 
 	/* Second step: Build UNION ALL query */
 	Query *finalQuery = BuildFacetUnionAllQuery(numStages, existingValue, baseCte,
