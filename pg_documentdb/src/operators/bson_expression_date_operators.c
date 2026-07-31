@@ -2528,7 +2528,7 @@ GetDateStringWithDefaultFormat(int64_t dateInMs, ExtensionTimezone timezone,
 	}
 	StringView result = {
 		.length = 24,
-		.string = strndup(buffer, 24),
+		.string = pnstrdup(buffer, 24),
 	};
 
 	return result;
@@ -2594,7 +2594,7 @@ GetTimestampStringWithDefaultFormat(const bson_value_t *timeStampBsonElement,
 
 	StringView result = {
 		.length = 19,
-		.string = strndup(buffer, 19),
+		.string = pnstrdup(buffer, 19),
 	};
 
 	return result;
@@ -2690,9 +2690,30 @@ GetPgTimestampFromEpochWithTimezone(int64_t epochInMs, ExtensionTimezone timezon
 	}
 
 
-	return OidFunctionCall2(PostgresTimestampToZoneFunctionId(),
-							CStringGetTextDatum(timezone.id),
-							GetPgTimestampFromUnixEpoch(epochInMs));
+	/* timestamptz_zone through the fmgr costs a catalog lookup, a text
+	 * palloc and the conversion per document; do the same conversion
+	 * directly (pg_tzset has an internal cache and the id was already
+	 * validated by ParseTimezone). */
+	pg_tz *pgTz = pg_tzset(timezone.id);
+	if (pgTz == NULL)
+	{
+		ThrowInvalidTimezoneIdentifier(timezone.id);
+	}
+
+	TimestampTz timestampTz = DatumGetTimestampTz(
+		GetPgTimestampFromUnixEpoch(epochInMs));
+	struct pg_tm tm;
+	fsec_t fsec;
+	int tzOffset;
+	Timestamp result;
+	if (timestamp2tm(timestampTz, &tzOffset, &tm, &fsec, NULL, pgTz) != 0 ||
+		tm2timestamp(&tm, fsec, NULL, &result) != 0)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						errmsg("timestamp out of range")));
+	}
+
+	return TimestampGetDatum(result);
 }
 
 
@@ -2880,79 +2901,32 @@ TryParseTwoDigitNumber(StringView str, uint32_t *result)
 static uint32_t
 GetDatePartFromPgTimestamp(Datum pgTimestamp, DatePart datePart)
 {
-	const char *partName;
+	/* Decompose the timestamp locally instead of calling timestamp_part
+	 * through the fmgr: OidFunctionCall2 costs a catalog lookup, a text
+	 * palloc and a fresh timestamp decomposition per part per document.
+	 * The formulas mirror PostgreSQL's timestamp_part cases exactly.
+	 * (The upstream TODOs below in GetDateStringWithDefaultFormat asked
+	 * for this.) */
+	Timestamp timestamp = DatumGetTimestamp(pgTimestamp);
+	struct pg_tm tm;
+	fsec_t fsec;
+	bool needsDecomposition = true;
 
 	switch (datePart)
 	{
 		case DatePart_Hour:
-		{
-			partName = "hour";
-			break;
-		}
-
 		case DatePart_Minute:
-		{
-			partName = "minute";
-			break;
-		}
-
 		case DatePart_Second:
-		{
-			partName = "second";
-			break;
-		}
-
 		case DatePart_Millisecond:
-		{
-			partName = "millisecond";
-			break;
-		}
-
 		case DatePart_Year:
-		{
-			partName = "year";
-			break;
-		}
-
 		case DatePart_Month:
-		{
-			partName = "month";
-			break;
-		}
-
 		case DatePart_DayOfYear:
-		{
-			partName = "doy";
-			break;
-		}
-
 		case DatePart_DayOfMonth:
-		{
-			partName = "day";
-			break;
-		}
-
 		case DatePart_DayOfWeek:
-		{
-			partName = "dow";
-			break;
-		}
-
 		case DatePart_IsoWeekYear:
-		{
-			partName = "isoyear";
-			break;
-		}
-
 		case DatePart_IsoWeek:
-		{
-			partName = "week";
-			break;
-		}
-
 		case DatePart_IsoDayOfWeek:
 		{
-			partName = "isodow";
 			break;
 		}
 
@@ -2983,23 +2957,101 @@ GetDatePartFromPgTimestamp(Datum pgTimestamp, DatePart datePart)
 		}
 	}
 
-	Datum partDatum = OidFunctionCall2(PostgresDatePartFunctionId(),
-									   CStringGetTextDatum(partName), pgTimestamp);
-	double float8 = DatumGetFloat8(partDatum);
-	uint32_t result = (uint32_t) float8;
-
-	if (datePart == DatePart_Millisecond)
+	if (needsDecomposition &&
+		timestamp2tm(timestamp, NULL, &tm, &fsec, NULL, NULL) != 0)
 	{
-		/* In postgres the millisecond part includes full seconds, so we need to strip out the seconds and get the MS part only.
-		 * We use round rather than downcast because precision can be lost when postgres gets the milliseconds from the date. */
-		result = (uint32_t) round(float8);
-		result = result % MILLISECONDS_IN_SECOND;
+		ereport(ERROR, (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+						errmsg("timestamp out of range")));
 	}
 
-	if (datePart == DatePart_DayOfWeek)
+	uint32_t result = 0;
+	switch (datePart)
 	{
-		/* Postgres range for dow is 0-6; adjust to 1-7 range */
-		result = result + 1;
+		case DatePart_Hour:
+		{
+			result = (uint32_t) tm.tm_hour;
+			break;
+		}
+
+		case DatePart_Minute:
+		{
+			result = (uint32_t) tm.tm_min;
+			break;
+		}
+
+		case DatePart_Second:
+		{
+			result = (uint32_t) tm.tm_sec;
+			break;
+		}
+
+		case DatePart_Millisecond:
+		{
+			/* In postgres the millisecond part includes full seconds, so we
+			 * strip out the seconds and keep the MS part only. Round rather
+			 * than downcast because precision can be lost when converting. */
+			double milliseconds = (tm.tm_sec * 1000.0) + (fsec / 1000.0);
+			result = ((uint32_t) round(milliseconds)) % MILLISECONDS_IN_SECOND;
+			break;
+		}
+
+		case DatePart_Year:
+		{
+			result = (uint32_t) tm.tm_year;
+			break;
+		}
+
+		case DatePart_Month:
+		{
+			result = (uint32_t) tm.tm_mon;
+			break;
+		}
+
+		case DatePart_DayOfYear:
+		{
+			result = (uint32_t) (date2j(tm.tm_year, tm.tm_mon, tm.tm_mday) -
+								 date2j(tm.tm_year, 1, 1) + 1);
+			break;
+		}
+
+		case DatePart_DayOfMonth:
+		{
+			result = (uint32_t) tm.tm_mday;
+			break;
+		}
+
+		case DatePart_DayOfWeek:
+		{
+			/* Postgres range for dow is 0-6; adjust to 1-7 range */
+			result = (uint32_t) (j2day(date2j(tm.tm_year, tm.tm_mon,
+											  tm.tm_mday)) + 1);
+			break;
+		}
+
+		case DatePart_IsoWeekYear:
+		{
+			result = (uint32_t) date2isoyear(tm.tm_year, tm.tm_mon, tm.tm_mday);
+			break;
+		}
+
+		case DatePart_IsoWeek:
+		{
+			result = (uint32_t) date2isoweek(tm.tm_year, tm.tm_mon, tm.tm_mday);
+			break;
+		}
+
+		case DatePart_IsoDayOfWeek:
+		{
+			int isoDow = j2day(date2j(tm.tm_year, tm.tm_mon, tm.tm_mday));
+			result = (uint32_t) (isoDow == 0 ? 7 : isoDow);
+			break;
+		}
+
+		default:
+		{
+			/* handled in the first switch */
+			break;
+		}
 	}
 
 	return result;
