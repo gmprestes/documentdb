@@ -322,6 +322,7 @@ extern bool EnableIdIndexPushdown;
 extern bool ForceIndexOnlyScanIfAvailable;
 extern bool EnableIdIndexCustomCostFunction;
 extern bool EnableIndexOnlyScan;
+extern double CoveredIndexOnlyScanCostFactor;
 extern bool EnableOrderByIdOnCostFunction;
 extern bool EnablePrimaryKeyCursorScan;
 
@@ -1811,6 +1812,21 @@ RelHasOnlyShardKeyOrMarkerQuals(RelOptInfo *rel)
 
 
 /*
+ * Expressions evaluated over reconstructed index tuples (a handful of small
+ * inline fields) cost a fraction of the planner's per-document pricing, which
+ * assumes full-document detoast and walk. Discount covered-projection paths
+ * accordingly so they compete fairly with parallel heap plans.
+ */
+static void
+ApplyCoveredProjectionCostDiscount(IndexPath *indexPath)
+{
+	indexPath->indextotalcost *= CoveredIndexOnlyScanCostFactor;
+	indexPath->path.startup_cost *= CoveredIndexOnlyScanCostFactor;
+	indexPath->path.total_cost *= CoveredIndexOnlyScanCostFactor;
+}
+
+
+/*
  * Builds an index-only IndexPath over a composite index that fully covers the
  * projection's required paths. Used when the corresponding plain index path
  * did not survive add_path (e.g. hash-based DISTINCT provides no useful
@@ -1902,6 +1918,7 @@ TryBuildCoveredIndexOnlyPath(PlannerInfo *root, RelOptInfo *rel, Index rti,
 											   NIL, NIL, NIL,
 											   ForwardScanDirection, indexOnly,
 											   NULL, 1, partialPath);
+		ApplyCoveredProjectionCostDiscount(newPath);
 		return newPath;
 	}
 
@@ -2058,6 +2075,11 @@ ConsiderIndexOnlyScan(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 		bool partialPath = false;
 		double loopCount = 1.0;
 		cost_index(indexPathCopy, root, loopCount, partialPath);
+
+		if (requiredPaths != NIL)
+		{
+			ApplyCoveredProjectionCostDiscount(indexPathCopy);
+		}
 
 		addedPaths = lappend(addedPaths, indexPathCopy);
 	}

@@ -97,6 +97,9 @@ bool EnableIndexOnlyScan = DEFAULT_ENABLE_INDEX_ONLY_SCAN;
 #define DEFAULT_ENABLE_INDEX_DISTINCT_SCAN false
 bool EnableIndexDistinctScan = DEFAULT_ENABLE_INDEX_DISTINCT_SCAN;
 
+#define DEFAULT_COVERED_INDEX_ONLY_SCAN_COST_FACTOR 0.25
+double CoveredIndexOnlyScanCostFactor = DEFAULT_COVERED_INDEX_ONLY_SCAN_COST_FACTOR;
+
 #define DEFAULT_ENABLE_ID_INDEX_CUSTOM_COST_FUNCTION true
 bool EnableIdIndexCustomCostFunction = DEFAULT_ENABLE_ID_INDEX_CUSTOM_COST_FUNCTION;
 
@@ -639,6 +642,17 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 		gettext_noop(
 			"Whether to answer filter-less distinct commands by enumerating a covering index's entry tree."),
 		NULL, &EnableIndexDistinctScan, DEFAULT_ENABLE_INDEX_DISTINCT_SCAN,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomRealVariable(
+		psprintf("%s.coveredIndexOnlyScanCostFactor", newGucPrefix),
+		gettext_noop(
+			"Cost multiplier for index only scans that serve covered projections: "
+			"expressions over reconstructed index tuples are far cheaper than the "
+			"planner's per-document pricing, so these paths are discounted."),
+		NULL, &CoveredIndexOnlyScanCostFactor,
+		DEFAULT_COVERED_INDEX_ONLY_SCAN_COST_FACTOR,
+		0.0, 1.0,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
